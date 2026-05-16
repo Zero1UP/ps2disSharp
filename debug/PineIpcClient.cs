@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 using System.Text;
@@ -9,6 +10,8 @@ namespace PS2Disassembler
     {
         private string _host = AppSettings.DefaultDebugHost;
         private int _port = AppSettings.DefaultPinePort;
+        private const uint EeRamSizeBytes = 0x02000000u;
+        private const int MaxIpcPayloadBytes = 600000;
 
         private TcpClient? _client;
         private NetworkStream? _stream;
@@ -113,6 +116,8 @@ namespace PS2Disassembler
             if (length <= 0)
                 return Array.Empty<byte>();
 
+            addr = NormalizeAndValidateEeRamRange(addr, length);
+
             byte[] result = new byte[length];
             int i = 0;
             while (i < length)
@@ -140,23 +145,119 @@ namespace PS2Disassembler
             if (data == null || data.Length == 0)
                 return;
 
+            addr = NormalizeAndValidateEeRamRange(addr, data.Length);
+            WriteMemoryBatched(addr, data);
+        }
+
+        public void WritePatchesBatched(IReadOnlyList<(uint Addr, byte[] Bytes)> patches)
+        {
+            if (patches == null || patches.Count == 0)
+                return;
+
+            byte[] payload = new byte[MaxIpcPayloadBytes];
+            int payloadLength = 0;
+
+            foreach (var (rawAddr, bytes) in patches)
+            {
+                if (bytes == null || bytes.Length == 0)
+                    continue;
+
+                uint addr = NormalizeAndValidateEeRamRange(rawAddr, bytes.Length);
+                AppendWriteCommands(addr, bytes, payload, ref payloadLength);
+            }
+
+            FlushPayload(payload, ref payloadLength);
+        }
+
+        private void WriteMemoryBatched(uint addr, byte[] data)
+        {
+            byte[] payload = new byte[MaxIpcPayloadBytes];
+            int payloadLength = 0;
+            AppendWriteCommands(addr, data, payload, ref payloadLength);
+            FlushPayload(payload, ref payloadLength);
+        }
+
+        private void AppendWriteCommands(uint addr, byte[] data, byte[] payload, ref int payloadLength)
+        {
             int i = 0;
             while (i < data.Length)
             {
                 uint cur = addr + (uint)i;
                 int remaining = data.Length - i;
-                if ((cur & 3u) == 0 && remaining >= 4)
+                int valueSize = SelectWriteValueSize(cur, remaining);
+                int commandSize = 1 + 4 + valueSize;
+
+                if (payloadLength + commandSize > payload.Length)
+                    FlushPayload(payload, ref payloadLength);
+
+                payload[payloadLength++] = (byte)GetWriteCommand(valueSize);
+                WriteUInt32LE(payload, payloadLength, cur);
+                payloadLength += 4;
+
+                switch (valueSize)
                 {
-                    uint value = BitConverter.ToUInt32(data, i);
-                    Write32(cur, value);
-                    i += 4;
+                    case 8:
+                        ulong value64 = BitConverter.ToUInt64(data, i);
+                        WriteUInt64LE(payload, payloadLength, value64);
+                        break;
+                    case 4:
+                        uint value32 = BitConverter.ToUInt32(data, i);
+                        WriteUInt32LE(payload, payloadLength, value32);
+                        break;
+                    case 2:
+                        ushort value16 = BitConverter.ToUInt16(data, i);
+                        payload[payloadLength + 0] = (byte)(value16 & 0xFF);
+                        payload[payloadLength + 1] = (byte)(value16 >> 8);
+                        break;
+                    default:
+                        payload[payloadLength] = data[i];
+                        break;
                 }
-                else
-                {
-                    Write8(cur, data[i]);
-                    i++;
-                }
+
+                payloadLength += valueSize;
+                i += valueSize;
             }
+        }
+
+        private void FlushPayload(byte[] payload, ref int payloadLength)
+        {
+            if (payloadLength <= 0)
+                return;
+
+            SendCommand(payload, payloadLength);
+            payloadLength = 0;
+        }
+
+        private static int SelectWriteValueSize(uint addr, int remaining)
+        {
+            if ((addr & 7u) == 0 && remaining >= 8)
+                return 8;
+            if ((addr & 3u) == 0 && remaining >= 4)
+                return 4;
+            if ((addr & 1u) == 0 && remaining >= 2)
+                return 2;
+            return 1;
+        }
+
+        private static PineCmd GetWriteCommand(int valueSize) => valueSize switch
+        {
+            8 => PineCmd.MsgWrite64,
+            4 => PineCmd.MsgWrite32,
+            2 => PineCmd.MsgWrite16,
+            _ => PineCmd.MsgWrite8
+        };
+
+        private static uint NormalizeAndValidateEeRamRange(uint addr, int length)
+        {
+            uint normalized = addr & 0x1FFFFFFFu;
+            if (length <= 0)
+                return normalized;
+
+            ulong endExclusive = (ulong)normalized + (uint)length;
+            if (normalized >= EeRamSizeBytes || endExclusive > EeRamSizeBytes)
+                throw new IOException($"PINE EE RAM access out of range: 0x{normalized:X8}, len {length}.");
+
+            return normalized;
         }
 
         private byte Read8(uint addr)
@@ -203,21 +304,25 @@ namespace PS2Disassembler
             return Encoding.UTF8.GetString(rsp, 5, len).TrimEnd('\0');
         }
 
-        private byte[] SendCommand(byte[] payload)
+        private byte[] SendCommand(byte[] payload) => SendCommand(payload, payload.Length);
+
+        private byte[] SendCommand(byte[] payload, int payloadLength)
         {
             lock (_sync)
             {
                 if (_stream == null || _client == null || !_client.Connected)
                     throw new IOException("PINE not connected.");
+                if (payloadLength <= 0 || payloadLength > payload.Length)
+                    throw new IOException($"Invalid PINE payload length: {payloadLength}");
 
                 // Write the 4-byte length prefix using the pre-allocated buffer.
-                int msgLen = payload.Length + 4;
+                int msgLen = payloadLength + 4;
                 _lenBuf[0] = (byte) msgLen;
                 _lenBuf[1] = (byte)(msgLen >> 8);
                 _lenBuf[2] = (byte)(msgLen >> 16);
                 _lenBuf[3] = (byte)(msgLen >> 24);
                 _stream.Write(_lenBuf, 0, 4);
-                _stream.Write(payload, 0, payload.Length);
+                _stream.Write(payload, 0, payloadLength);
                 _stream.Flush();
 
                 // Read response length into pre-allocated buffer (no allocation).
@@ -261,6 +366,18 @@ namespace PS2Disassembler
             buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
             buffer[offset + 2] = (byte)((value >> 16) & 0xFF);
             buffer[offset + 3] = (byte)((value >> 24) & 0xFF);
+        }
+
+        private static void WriteUInt64LE(byte[] buffer, int offset, ulong value)
+        {
+            buffer[offset + 0] = (byte)(value & 0xFF);
+            buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
+            buffer[offset + 2] = (byte)((value >> 16) & 0xFF);
+            buffer[offset + 3] = (byte)((value >> 24) & 0xFF);
+            buffer[offset + 4] = (byte)((value >> 32) & 0xFF);
+            buffer[offset + 5] = (byte)((value >> 40) & 0xFF);
+            buffer[offset + 6] = (byte)((value >> 48) & 0xFF);
+            buffer[offset + 7] = (byte)((value >> 56) & 0xFF);
         }
 
         public void Dispose() => Disconnect();

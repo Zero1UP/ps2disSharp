@@ -674,6 +674,158 @@ namespace PS2Disassembler
         }
     }
 
+    internal sealed class CodeDesignerRichTextBox : RichTextBox
+    {
+        private const int EM_SETOPTIONS = 0x044D;
+        private const int ECOOP_AND = 0x0003;
+        private const int ECO_AUTOWORDSELECTION = 0x0001;
+
+        private bool _preciseSelecting;
+        private int _selectionAnchor;
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            DisableNativeAutoWordSelection();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                Focus();
+                DisableNativeAutoWordSelection();
+
+                int index = GetPreciseCharIndex(e.Location);
+                if ((ModifierKeys & Keys.Shift) == Keys.Shift)
+                {
+                    _selectionAnchor = SelectionLength > 0
+                        ? SelectionStart
+                        : Math.Max(0, Math.Min(SelectionStart, TextLength));
+                }
+                else
+                {
+                    _selectionAnchor = index;
+                }
+
+                _preciseSelecting = true;
+                Capture = true;
+                SelectFromAnchor(index);
+                return;
+            }
+
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (_preciseSelecting && (e.Button & MouseButtons.Left) == MouseButtons.Left)
+            {
+                SelectFromAnchor(GetPreciseCharIndex(e.Location));
+                return;
+            }
+
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (_preciseSelecting && e.Button == MouseButtons.Left)
+            {
+                SelectFromAnchor(GetPreciseCharIndex(e.Location));
+                _preciseSelecting = false;
+                Capture = false;
+                return;
+            }
+
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                int index = GetPreciseCharIndex(e.Location);
+                _selectionAnchor = index;
+                Select(index, 0);
+                return;
+            }
+
+            base.OnMouseDoubleClick(e);
+        }
+
+        private void SelectFromAnchor(int index)
+        {
+            int start = Math.Max(0, Math.Min(_selectionAnchor, index));
+            int end = Math.Max(0, Math.Max(_selectionAnchor, index));
+            if (start > TextLength) start = TextLength;
+            if (end > TextLength) end = TextLength;
+            Select(start, end - start);
+        }
+
+        private int GetPreciseCharIndex(Point location)
+        {
+            if (TextLength <= 0)
+                return 0;
+
+            int x = Math.Max(0, Math.Min(location.X, Math.Max(0, ClientSize.Width - 1)));
+            int y = Math.Max(0, Math.Min(location.Y, Math.Max(0, ClientSize.Height - 1)));
+            int index = Math.Max(0, Math.Min(GetCharIndexFromPosition(new Point(x, y)), TextLength));
+            if (index >= TextLength)
+                return TextLength;
+
+            int line = Math.Max(0, GetLineFromCharIndex(index));
+            int lineStart = GetFirstCharIndexFromLine(line);
+            if (lineStart < 0)
+                lineStart = 0;
+
+            int nextLineStart = GetFirstCharIndexFromLine(line + 1);
+            int lineEnd = nextLineStart >= 0 ? Math.Max(lineStart, nextLineStart - 1) : TextLength;
+            while (lineEnd > lineStart && lineEnd <= TextLength && (Text[lineEnd - 1] == '\r' || Text[lineEnd - 1] == '\n'))
+                lineEnd--;
+
+            Point charPoint = GetPositionFromCharIndex(index);
+            if (x <= charPoint.X)
+                return Math.Max(lineStart, Math.Min(index, lineEnd));
+
+            int charWidth = EstimateCharacterWidth(index);
+            if (x > charPoint.X + (charWidth / 2) && index < lineEnd)
+                index++;
+
+            return Math.Max(lineStart, Math.Min(index, lineEnd));
+        }
+
+        private int EstimateCharacterWidth(int index)
+        {
+            if (index < 0 || index >= TextLength)
+                return Math.Max(1, TextRenderer.MeasureText("M", Font, Size.Empty, TextFormatFlags.NoPadding).Width);
+
+            char c = Text[index];
+            if (c == '\t')
+                return Math.Max(1, TextRenderer.MeasureText("    ", Font, Size.Empty, TextFormatFlags.NoPadding).Width);
+            if (c == '\r' || c == '\n')
+                return Math.Max(1, TextRenderer.MeasureText("M", Font, Size.Empty, TextFormatFlags.NoPadding).Width);
+            return Math.Max(1, TextRenderer.MeasureText(c.ToString(), Font, Size.Empty, TextFormatFlags.NoPadding).Width);
+        }
+
+        private void DisableNativeAutoWordSelection()
+        {
+            AutoWordSelection = false;
+            if (!IsHandleCreated)
+                return;
+
+            try
+            {
+                NativeMethods.SendMessage(
+                    Handle,
+                    EM_SETOPTIONS,
+                    new IntPtr(ECOOP_AND),
+                    new IntPtr(unchecked((int)~ECO_AUTOWORDSELECTION)));
+            }
+            catch { }
+        }
+    }
+
     internal sealed class CodeDesignerInstance : UserControl
     {
         private readonly CodeDesignerWorkspace _workspace;
@@ -698,6 +850,27 @@ namespace PS2Disassembler
         private int _lastKnownFirstVisibleLine;
         private readonly HashSet<int> _compileErrorLines = new();
         private bool _applyingCompileErrorStyle;
+        private const int MaxEditorHistorySnapshots = 1024;
+        private readonly Stack<EditorSnapshot> _undoHistory = new();
+        private readonly Stack<EditorSnapshot> _redoHistory = new();
+        private bool _suppressEditorHistory;
+        private string _lastHistoryText = string.Empty;
+        private int _lastHistorySelectionStart;
+        private int _lastHistorySelectionLength;
+
+        private sealed class EditorSnapshot
+        {
+            public string Text { get; }
+            public int SelectionStart { get; }
+            public int SelectionLength { get; }
+
+            public EditorSnapshot(string text, int selectionStart, int selectionLength)
+            {
+                Text = text ?? string.Empty;
+                SelectionStart = Math.Max(0, selectionStart);
+                SelectionLength = Math.Max(0, selectionLength);
+            }
+        }
 
         public CodeDesignerInstance(CodeDesignerWorkspace workspace)
         {
@@ -731,7 +904,7 @@ namespace PS2Disassembler
             _inputLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 54f));
             _inputLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             _inputLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-            _input = new RichTextBox
+            _input = new CodeDesignerRichTextBox
             {
                 Dock = DockStyle.Fill,
                 BorderStyle = BorderStyle.None,
@@ -740,6 +913,8 @@ namespace PS2Disassembler
                 WordWrap = false,
                 ScrollBars = RichTextBoxScrollBars.Both,
                 DetectUrls = false,
+                AutoWordSelection = false,
+                ShortcutsEnabled = true,
             };
             _lineNumbers = new CodeDesignerLineNumberPanel(_input) { Dock = DockStyle.Fill, Width = 54 };
             _inputLayout.Controls.Add(_lineNumbers, 0, 0);
@@ -777,13 +952,31 @@ namespace PS2Disassembler
                 if (_syntaxPending)
                     ApplySyntaxHighlighting();
             };
+            _lastHistoryText = _input.Text;
+            CaptureEditorSelection();
+            _input.KeyDown += OnInputKeyDown;
+            _input.SelectionChanged += (_, _) =>
+            {
+                if (!_suppressEditorHistory && !_applyingSyntax && !_applyingCompileErrorStyle)
+                    CaptureEditorSelection();
+            };
             _input.TextChanged += (_, _) =>
             {
+                if (_suppressEditorHistory)
+                {
+                    _lastInputLength = _input.TextLength;
+                    UpdateLineNumberWidth();
+                    CaptureEditorSelection();
+                    return;
+                }
+
                 if (_applyingSyntax || _applyingCompileErrorStyle) return;
+                TrackEditorTextChange();
                 ClearCompileErrorForCurrentLine();
                 QueueChangedLineSyntax();
                 _lastInputLength = _input.TextLength;
                 UpdateLineNumberWidth();
+                CaptureEditorSelection();
             };
             _input.VScroll += (_, _) =>
             {
@@ -812,21 +1005,224 @@ namespace PS2Disassembler
         private ContextMenuStrip BuildEditorContextMenu(RichTextBox box, bool allowPaste)
         {
             var menu = new ContextMenuStrip();
-            var copy = new ToolStripMenuItem("Copy", null, (_, _) => { if (box.SelectionLength > 0) box.Copy(); });
+            ToolStripMenuItem? undo = null;
+            ToolStripMenuItem? redo = null;
+            if (ReferenceEquals(box, _input))
+            {
+                undo = new ToolStripMenuItem("Undo", null, (_, _) => UndoEditorChange());
+                redo = new ToolStripMenuItem("Redo", null, (_, _) => RedoEditorChange());
+                menu.Items.Add(undo);
+                menu.Items.Add(redo);
+                menu.Items.Add(new ToolStripSeparator());
+            }
+
+            var copy = new ToolStripMenuItem("Copy", null, (_, _) => CopySelectionToClipboard(box));
             menu.Items.Add(copy);
             ToolStripMenuItem? paste = null;
             if (allowPaste)
             {
-                paste = new ToolStripMenuItem("Paste", null, (_, _) => { if (Clipboard.ContainsText()) box.Paste(); });
+                paste = new ToolStripMenuItem("Paste", null, (_, _) => PerformSanitizedPaste());
                 menu.Items.Add(paste);
             }
             menu.Opening += (_, _) =>
             {
+                if (undo != null) undo.Enabled = _undoHistory.Count > 0;
+                if (redo != null) redo.Enabled = _redoHistory.Count > 0;
                 copy.Enabled = box.SelectionLength > 0;
                 if (paste != null)
-                    paste.Enabled = Clipboard.ContainsText();
+                    paste.Enabled = Clipboard.ContainsText(TextDataFormat.UnicodeText) || Clipboard.ContainsText(TextDataFormat.Text);
             };
             return menu;
+        }
+
+        private void OnInputKeyDown(object? sender, KeyEventArgs e)
+        {
+            CaptureEditorSelection();
+
+            if (!e.Control || e.Alt)
+                return;
+
+            if (e.KeyCode == Keys.Z && !e.Shift)
+            {
+                UndoEditorChange();
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Y || (e.KeyCode == Keys.Z && e.Shift))
+            {
+                RedoEditorChange();
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.V)
+            {
+                PerformSanitizedPaste();
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.C)
+            {
+                CopySelectionToClipboard(_input);
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.X)
+            {
+                if (_input.SelectionLength > 0)
+                {
+                    CopySelectionToClipboard(_input);
+                    _input.SelectedText = string.Empty;
+                }
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+            }
+        }
+
+        private void CaptureEditorSelection()
+        {
+            if (_input.IsDisposed)
+                return;
+
+            _lastHistorySelectionStart = Math.Max(0, Math.Min(_input.SelectionStart, _input.TextLength));
+            _lastHistorySelectionLength = Math.Max(0, Math.Min(_input.SelectionLength, _input.TextLength - _lastHistorySelectionStart));
+        }
+
+        private EditorSnapshot CaptureCurrentEditorSnapshot()
+        {
+            CaptureEditorSelection();
+            return new EditorSnapshot(_input.Text, _lastHistorySelectionStart, _lastHistorySelectionLength);
+        }
+
+        private void TrackEditorTextChange()
+        {
+            string current = _input.Text;
+            if (string.Equals(current, _lastHistoryText, StringComparison.Ordinal))
+                return;
+
+            PushUndoSnapshot(new EditorSnapshot(_lastHistoryText, _lastHistorySelectionStart, _lastHistorySelectionLength));
+            _redoHistory.Clear();
+            _lastHistoryText = current;
+        }
+
+        private void PushUndoSnapshot(EditorSnapshot snapshot)
+        {
+            if (_undoHistory.Count > 0)
+            {
+                EditorSnapshot top = _undoHistory.Peek();
+                if (string.Equals(top.Text, snapshot.Text, StringComparison.Ordinal) &&
+                    top.SelectionStart == snapshot.SelectionStart &&
+                    top.SelectionLength == snapshot.SelectionLength)
+                    return;
+            }
+
+            if (_undoHistory.Count >= MaxEditorHistorySnapshots)
+            {
+                var keep = _undoHistory.Reverse().Skip(1).ToArray();
+                _undoHistory.Clear();
+                foreach (var item in keep)
+                    _undoHistory.Push(item);
+            }
+
+            _undoHistory.Push(snapshot);
+        }
+
+        private void ResetEditorHistory()
+        {
+            _undoHistory.Clear();
+            _redoHistory.Clear();
+            _lastHistoryText = _input.Text;
+            CaptureEditorSelection();
+        }
+
+        private void UndoEditorChange()
+        {
+            if (_undoHistory.Count == 0)
+                return;
+
+            EditorSnapshot current = CaptureCurrentEditorSnapshot();
+            EditorSnapshot target = _undoHistory.Pop();
+            _redoHistory.Push(current);
+            RestoreEditorSnapshot(target);
+        }
+
+        private void RedoEditorChange()
+        {
+            if (_redoHistory.Count == 0)
+                return;
+
+            EditorSnapshot current = CaptureCurrentEditorSnapshot();
+            EditorSnapshot target = _redoHistory.Pop();
+            PushUndoSnapshot(current);
+            RestoreEditorSnapshot(target);
+        }
+
+        private void RestoreEditorSnapshot(EditorSnapshot snapshot)
+        {
+            _suppressEditorHistory = true;
+            try
+            {
+                _compileErrorLines.Clear();
+                _input.Text = snapshot.Text;
+                int start = Math.Max(0, Math.Min(snapshot.SelectionStart, _input.TextLength));
+                int length = Math.Max(0, Math.Min(snapshot.SelectionLength, _input.TextLength - start));
+                _input.Select(start, length);
+                _lastHistoryText = _input.Text;
+                _lastInputLength = _input.TextLength;
+                UpdateLineNumberWidth();
+                CaptureEditorSelection();
+            }
+            finally
+            {
+                _suppressEditorHistory = false;
+            }
+
+            if (_isActive)
+                QueueVisibleSyntax(immediate: false);
+        }
+
+        private void PerformSanitizedPaste()
+        {
+            if (!Clipboard.ContainsText(TextDataFormat.UnicodeText) && !Clipboard.ContainsText(TextDataFormat.Text))
+                return;
+
+            CaptureEditorSelection();
+            string text = Clipboard.ContainsText(TextDataFormat.UnicodeText)
+                ? Clipboard.GetText(TextDataFormat.UnicodeText)
+                : Clipboard.GetText(TextDataFormat.Text);
+            text = NormalizePastedText(text);
+            _input.SelectedText = text;
+        }
+
+        private static string NormalizePastedText(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            string normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+            if (normalized.IndexOf('\n') >= 0 && normalized.EndsWith("\n", StringComparison.Ordinal))
+                normalized = normalized.Substring(0, normalized.Length - 1);
+            return normalized.Replace("\n", Environment.NewLine);
+        }
+
+        private static void CopySelectionToClipboard(RichTextBox box)
+        {
+            if (box.SelectionLength <= 0)
+                return;
+
+            string text = NormalizeCopiedText(box.SelectedText);
+            if (text.Length > 0)
+                Clipboard.SetText(text, TextDataFormat.UnicodeText);
+        }
+
+        private static string NormalizeCopiedText(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            string normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+            if (normalized.IndexOf('\n') >= 0 && normalized.EndsWith("\n", StringComparison.Ordinal))
+                normalized = normalized.Substring(0, normalized.Length - 1);
+            return normalized.Replace("\n", Environment.NewLine);
         }
 
         public void FocusInput() => _input.Focus();
@@ -858,9 +1254,19 @@ namespace PS2Disassembler
         public void SetText(string text)
         {
             ClearAllCompileErrorHighlights(recolorAfterClear: false);
-            _input.Text = text ?? string.Empty;
-            _lastInputLength = _input.TextLength;
-            UpdateLineNumberWidth();
+            _suppressEditorHistory = true;
+            try
+            {
+                _input.Text = text ?? string.Empty;
+                _input.Select(0, 0);
+                _lastInputLength = _input.TextLength;
+                UpdateLineNumberWidth();
+            }
+            finally
+            {
+                _suppressEditorHistory = false;
+            }
+            ResetEditorHistory();
             _needsFullSyntaxOnActivate = true;
             if (_isActive)
             {
@@ -1133,6 +1539,14 @@ namespace PS2Disassembler
                 // open-file full-document coloring during initial tab creation.
                 _syntaxTimer.Stop();
                 _syntaxTimer.Interval = 75;
+                _syntaxTimer.Start();
+                return;
+            }
+
+            if (_input.Focused && (Control.MouseButtons & MouseButtons.Left) == MouseButtons.Left)
+            {
+                _syntaxTimer.Stop();
+                _syntaxTimer.Interval = 80;
                 _syntaxTimer.Start();
                 return;
             }
@@ -1462,6 +1876,15 @@ namespace PS2Disassembler
         {
             "address","print","import","hexcode","float",".word",".byte",".half",".ascii",".asciiz",".space",".text",".data",".globl",".align"
         };
+
+        public static bool IsKnownInstructionOrDirective(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                return false;
+
+            return Instructions.Any(x => x.Equals(token, StringComparison.OrdinalIgnoreCase))
+                || Directives.Any(x => x.Equals(token, StringComparison.OrdinalIgnoreCase));
+        }
 
         public static void Apply(RichTextBox box, bool dark)
         {
@@ -1866,10 +2289,25 @@ namespace PS2Disassembler
             }
             else
             {
-                var leadingColon = Regex.Match(text, "^:([A-Za-z_][\\w.]*)\\b");
-                if (!leadingColon.Success) return text;
-                label = CleanLabelName(leadingColon.Groups[1].Value);
-                consumed = leadingColon.Length;
+                var leadingColon = Regex.Match(text, @"^:([A-Za-z_][\w.]*)\b");
+                if (leadingColon.Success)
+                {
+                    label = CleanLabelName(leadingColon.Groups[1].Value);
+                    consumed = leadingColon.Length;
+                }
+                else
+                {
+                    var standaloneFunction = Regex.Match(text, @"^([A-Za-z_][\w.]*)\s*$", RegexOptions.CultureInvariant);
+                    if (!standaloneFunction.Success)
+                        return text;
+
+                    string candidate = CleanLabelName(standaloneFunction.Groups[1].Value);
+                    if (!IsStandaloneFunctionLabel(candidate) || CodeDesignerSyntaxHighlighter.IsKnownInstructionOrDirective(candidate))
+                        return text;
+
+                    label = candidate;
+                    consumed = text.Length;
+                }
             }
 
             if (label.Length == 0) return text.Substring(consumed).Trim();
@@ -1887,6 +2325,13 @@ namespace PS2Disassembler
         private static string CleanLabelName(string text)
         {
             return (text ?? string.Empty).Trim().Trim(':');
+        }
+
+        private static bool IsStandaloneFunctionLabel(string text)
+        {
+            return !string.IsNullOrWhiteSpace(text)
+                && (text.StartsWith("FNC_", StringComparison.OrdinalIgnoreCase)
+                    || text.StartsWith("FUNC_", StringComparison.OrdinalIgnoreCase));
         }
 
         private uint GetLineSize(string text)
@@ -2040,6 +2485,8 @@ namespace PS2Disassembler
                 return;
             }
 
+            ValidateLabelReferences(text);
+
             if (TryEmitBranchInstruction(text, ref pc, output))
                 return;
 
@@ -2051,6 +2498,44 @@ namespace PS2Disassembler
                 throw new InvalidOperationException($"Unable to assemble '{text}'.");
             output.Add(FormatOutput(pc, wordValue.Value));
             pc += 4;
+        }
+
+        private void ValidateLabelReferences(string text)
+        {
+            foreach (Match m in Regex.Matches(text, @":([A-Za-z_][\w.]*)", RegexOptions.CultureInvariant))
+            {
+                string name = CleanLabelName(m.Groups[1].Value);
+                if (name.Length > 0 && !_labels.ContainsKey(name))
+                    throw new InvalidOperationException(UndefinedReferenceMessage(name));
+            }
+
+            string asm = NormalizeAssembly(text);
+            int sep = asm.IndexOfAny(new[] { ' ', '\t' });
+            string mnemonic = sep < 0 ? asm.ToLowerInvariant() : asm.Substring(0, sep).Trim().ToLowerInvariant();
+            if (mnemonic is not ("j" or "jal"))
+                return;
+
+            string operandText = sep < 0 ? string.Empty : asm.Substring(sep + 1).Trim();
+            string[] operands = operandText.Length == 0
+                ? Array.Empty<string>()
+                : operandText.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            if (operands.Length == 0)
+                throw new InvalidOperationException($"Jump target is missing for '{mnemonic}'.");
+
+            string target = CleanLabelName(operands[0]);
+            if (IsIdentifierLike(target) && !_labels.ContainsKey(target))
+                throw new InvalidOperationException(UndefinedReferenceMessage(target));
+        }
+
+        private static bool IsIdentifierLike(string text)
+        {
+            return Regex.IsMatch(text ?? string.Empty, @"^[A-Za-z_][\w.]*$", RegexOptions.CultureInvariant);
+        }
+
+        private static string UndefinedReferenceMessage(string name)
+        {
+            string kind = IsStandaloneFunctionLabel(name) ? "function" : "label/function";
+            return $"Undefined {kind} '{name}'.";
         }
 
         private void EmitStringBytes(string value, ref uint pc, List<string> output)
@@ -2174,6 +2659,8 @@ namespace PS2Disassembler
                 return labelAddress;
             if (_labels.TryGetValue((operand ?? string.Empty).Trim(), out labelAddress))
                 return labelAddress;
+            if (IsIdentifierLike(cleaned))
+                throw new InvalidOperationException(UndefinedReferenceMessage(cleaned));
             return ParseNumber(operand);
         }
 

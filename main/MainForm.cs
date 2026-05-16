@@ -98,6 +98,7 @@ namespace PS2Disassembler
         private DateTime _nextDebugServerRetryUtc = DateTime.MinValue;
         private DateTime _nextDebuggerPollUtc = DateTime.MinValue;
         private const int DebuggerPollIntervalMs = 150;
+        private const uint EeRamSizeBytes = 0x02000000u;
         private const uint WatchpointSizeBytes = 1u;
         private const uint EeCurrentThreadIdAddress = 0x000125ECu;
         private const uint EeThreadControlBlockBaseAddress = 0x00017400u;
@@ -116,6 +117,11 @@ namespace PS2Disassembler
         private bool _breakpointUiFrozen;
         private uint? _breakpointUiFrozenAddress;
         private bool _breakpointUiFrozenIsWatchpoint;
+        // Live register snapshot captured while the VM is paused at a break.
+        // Used to compute live annotations and follow-target addresses for
+        // visible rows around the active break PC. Null whenever the
+        // VM is not currently paused at a ps2dis#-tracked break.
+        private DebugRegisterSnapshot? _breakRegisterSnapshot;
         private uint? _readMemcheckAddress;
         private uint? _writeMemcheckAddress;
         private long _readMemcheckHits = -1;
@@ -167,6 +173,10 @@ namespace PS2Disassembler
             public int HexLength;
         }
         private DateTime _nextPineVisibleReadLogUtc = DateTime.MinValue;
+        private DateTime _nextVisibleDataRowRepaintUtc = DateTime.MinValue;
+        private DateTime _nextDisasmAnnotationRepaintUtc = DateTime.MinValue;
+        private const int VisibleDataRowRepaintIntervalMs = 100;
+        private const int DisasmAnnotationRepaintIntervalMs = 100;
         private string _lastStatusText = string.Empty;
         private const int DefaultLiveRefreshIntervalMs = 1000 / AppSettings.DefaultRefreshRate;
 
@@ -264,6 +274,7 @@ namespace PS2Disassembler
         private ToolStripMenuItem?            _miGoToMemoryView;
         private FlatTabPage?                 _codeDesignerPage;
         private CodeDesignerWorkspace?       _codeDesignerWorkspace;
+        private Panel?                       _startPanel;
         private readonly StatusStrip          _statusStrip;
         private readonly ToolStripStatusLabel _sbInfo;
         private readonly ToolStripStatusLabel _sbAddr;
@@ -461,6 +472,7 @@ namespace PS2Disassembler
             _miDetach = new ToolStripMenuItem("Disconnect from PCSX2",  null, (_, _) => DetachFromPcsx2()) { Enabled = false };
             fileMenu.DropDownItems.Add(_miAttach);
             fileMenu.DropDownItems.Add(_miDetach);
+            fileMenu.DropDownItems.Add(new ToolStripSeparator());
             fileMenu.DropDownItems.Add("Open PCSX2dis Project",          null, (_, _) => OpenPcsx2DisProject());
             fileMenu.DropDownItems.Add("Save PCSX2dis Project",          null, (_, _) => QuickSaveProject());
             fileMenu.DropDownItems.Add("Save PCSX2dis Project as..",     null, (_, _) => SavePcsx2DisProjectAs());
@@ -476,11 +488,6 @@ namespace PS2Disassembler
             editMenu.DropDownItems.Add("Set Disasm Region",             null, (_, _) => ShowSetRegion());
             editMenu.DropDownItems.Add(new ToolStripSeparator());
             editMenu.DropDownItems.Add("Options",                    null, (_, _) => ShowOptionsDialog());
-
-            var viewMenu = new ToolStripMenuItem("View");
-            viewMenu.DropDownItems.Add("Go to Start",       null, (_, _) => SelectRow(0));
-            viewMenu.DropDownItems.Add("Go to End",         null, (_, _) => SelectRow(_rows.Count - 1));
-            viewMenu.DropDownItems.Add("Go to Entry Point", null, (_, _) => GotoEntry());
 
             var anaMenu = new ToolStripMenuItem("Analyzer");
             anaMenu.DropDownItems.Add("Invoke Analyzer", null, (_, _) => RunXrefAnalyzer());
@@ -499,8 +506,8 @@ namespace PS2Disassembler
             _miBreakpointsMenu = breakpointsMenu;
             breakpointsMenu.Enabled = false; // disabled until attached to PCSX2
             breakpointsMenu.Visible = false; // invisible until attached to PCSX2
-            _miBreakpointsSidebar = new ToolStripMenuItem("Breakpoints") { CheckOnClick = true };
-            _miBreakpointsSidebar.CheckedChanged += (_, _) => SetBreakpointSidebarVisible(_miBreakpointsSidebar.Checked);
+            _miBreakpointsSidebar = new ToolStripMenuItem("Breakpoints") { CheckOnClick = false };
+            _miBreakpointsSidebar.Click += (_, _) => ToggleBreakpointSidebarFromMenu();
             _miSetBreakpoint = new ToolStripMenuItem("Set Breakpoint", null, (_, _) => SetBreakpointOnSelectedRow());
             _miClearBreakpoints = new ToolStripMenuItem("Clear All Breakpoints", null, (_, _) => ClearAllBreakpoints());
             breakpointsMenu.DropDownItems.AddRange(new ToolStripItem[]
@@ -511,6 +518,7 @@ namespace PS2Disassembler
                 new ToolStripSeparator(),
                 new ToolStripMenuItem("Access Monitor", null, (_, _) => ShowAccessMonitorWindow()),
             });
+            breakpointsMenu.DropDownOpening += (_, _) => SyncBreakpointSidebarMenuCheckState(IsBreakpointSidebarActuallyVisible());
 
             _menuStatusSpring = new ToolStripLabel
             {
@@ -548,13 +556,13 @@ namespace PS2Disassembler
                 UpdateTitleBarStatusOverlay();
             };
 
-            foreach (ToolStripItem topLevelItem in new ToolStripItem[] { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, _miCodeDesignerMenu, breakpointsMenu })
+            foreach (ToolStripItem topLevelItem in new ToolStripItem[] { fileMenu, editMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, _miCodeDesignerMenu, breakpointsMenu })
             {
                 topLevelItem.Margin = Padding.Empty;
             }
 
             _menuBar.Items.AddRange(new ToolStripItem[]
-                { fileMenu, editMenu, viewMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, _miCodeDesignerMenu, breakpointsMenu });
+                { fileMenu, editMenu, anaMenu, _miDisassemblerMenu, _miMainMemoryViewMenu, _miCodeManagerMenu, _miCodeDesignerMenu, breakpointsMenu });
             MainMenuStrip = _menuBar;
             _menuBar.MouseDown += OnMenuBarMouseDown;
             _menuBar.Paint += OnMenuBarPaintStatus;
@@ -814,6 +822,9 @@ namespace PS2Disassembler
             _breakpointsPanel = CreateBreakpointsSidebar();
             _breakpointsPanel.Dock = DockStyle.Fill;
             _disasmBreakpointSplit.Panel1.Controls.Add(_mainTabs);
+            _startPanel = CreateStartPanel();
+            _disasmBreakpointSplit.Panel1.Controls.Add(_startPanel);
+            _startPanel.BringToFront();
             _disasmBreakpointSplit.Panel2.Controls.Add(_breakpointsPanel);
             _disasmBreakpointSplit.Panel2Collapsed = true;
 
@@ -852,6 +863,8 @@ namespace PS2Disassembler
             ApplyDebugConnectionSettings();
             ApplyMainViewNavigationModeSetting();
             ApplyMemoryViewVisibilitySetting();
+            ApplyCodeDesignerVisibilitySetting();
+            UpdateStartPanelVisibility();
             ApplyFontFromSettings(_appSettings.FontFamily, _appSettings.FontSize);
             var startupTheme = _appSettings.Theme == "Light" ? AppTheme.Light : AppTheme.Dark;
             ApplyTheme(startupTheme);
@@ -865,6 +878,85 @@ namespace PS2Disassembler
                 Load += (_, _) => LoadFile(startFile, isRawDump: false);
         }
 
+        private Panel CreateStartPanel()
+        {
+            var panel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = _themeFormBack,
+                Visible = true,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+            };
+
+            var centerHost = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                RowCount = 3,
+                BackColor = Color.Transparent,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+            };
+            centerHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            centerHost.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            centerHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            centerHost.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+            centerHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            centerHost.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+
+            var buttons = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                BackColor = Color.Transparent,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+            };
+
+            var btnOpenBinary = new Button
+            {
+                Text = "Open Binary",
+                Width = 126,
+                Height = 34,
+                FlatStyle = FlatStyle.Flat,
+                Margin = new Padding(0, 0, 12, 0),
+            };
+            btnOpenBinary.Click += (_, _) => OpenBinary();
+
+            var btnConnect = new Button
+            {
+                Text = "Connect to PCSX2",
+                Width = 142,
+                Height = 34,
+                FlatStyle = FlatStyle.Flat,
+                Margin = Padding.Empty,
+            };
+            btnConnect.Click += (_, _) => AttachToPcsx2();
+
+            buttons.Controls.Add(btnOpenBinary);
+            buttons.Controls.Add(btnConnect);
+            centerHost.Controls.Add(buttons, 1, 1);
+            panel.Controls.Add(centerHost);
+            return panel;
+        }
+
+        private void UpdateStartPanelVisibility()
+        {
+            if (_startPanel == null || _startPanel.IsDisposed)
+                return;
+
+            bool show = _fileData == null;
+            _startPanel.Visible = show;
+            if (show)
+            {
+                _startPanel.BackColor = _themeFormBack;
+                _startPanel.BringToFront();
+            }
+        }
+
         private void ActivateMainViewTab(int index)
         {
             if (_mainTabs.Pages.Count <= index || index < 0)
@@ -876,6 +968,9 @@ namespace PS2Disassembler
             if (index == 2 && !IsLiveAttached())
                 return;
 
+            if (index == 3 && !(_appSettings?.ShowCodeDesigner ?? AppSettings.DefaultShowCodeDesigner))
+                return;
+
             _mainTabs.SelectedIndex = index;
             SyncMainViewMenuState();
         }
@@ -885,7 +980,14 @@ namespace PS2Disassembler
             int selectedIndex = _mainTabs?.SelectedIndex ?? -1;
             bool showMemoryView = _appSettings?.ShowMemoryView ?? AppSettings.DefaultShowMemoryView;
             bool showCodeManager = IsLiveAttached();
+            bool showCodeDesigner = _appSettings?.ShowCodeDesigner ?? AppSettings.DefaultShowCodeDesigner;
             bool showTabsInTitleBar = _appSettings?.ShowTabsInTitleBar ?? AppSettings.DefaultShowTabsInTitleBar;
+
+            if (_mainTabs != null && _mainTabs.Pages.Count > 2)
+            {
+                _mainTabs.SetTabEnabled(2, showCodeManager);
+                _mainTabs.SetTabVisible(2, showCodeManager);
+            }
 
             if (_miDisassemblerMenu != null)
             {
@@ -908,9 +1010,9 @@ namespace PS2Disassembler
 
             if (_miCodeDesignerMenu != null)
             {
-                _miCodeDesignerMenu.Visible = true;
-                _miCodeDesignerMenu.Enabled = true;
-                _miCodeDesignerMenu.Checked = selectedIndex == 3;
+                _miCodeDesignerMenu.Visible = showTabsInTitleBar && showCodeDesigner;
+                _miCodeDesignerMenu.Enabled = showCodeDesigner;
+                _miCodeDesignerMenu.Checked = showTabsInTitleBar && showCodeDesigner && selectedIndex == 3;
             }
         }
 

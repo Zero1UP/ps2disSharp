@@ -508,6 +508,12 @@ namespace PS2Disassembler
                     tcb.FlatStyle = FlatStyle.Flat;
                     tcb.ApplyPalette(_currentTheme == AppTheme.Dark, GetCheckBoxBackColor(tcb.Parent), _themeFormFore);
                     break;
+                case ThemedRadioButton trb:
+                    trb.ForeColor = _themeFormFore;
+                    trb.BackColor = Equals(trb.Parent?.Tag, "OptionsSurface") ? GetOptionsSurfaceBackColor() : _themeFormBack;
+                    trb.FlatStyle = FlatStyle.Flat;
+                    trb.ApplyPalette(_currentTheme == AppTheme.Dark, trb.BackColor, _themeFormFore);
+                    break;
                 case CheckBox cbx:
                     cbx.ForeColor = _themeFormFore;
                     cbx.BackColor = GetCheckBoxBackColor(cbx.Parent);
@@ -812,6 +818,132 @@ namespace PS2Disassembler
                     focusRect.Width = Math.Max(0, Math.Min(textRect.Width, TextRenderer.MeasureText(Text ?? string.Empty, Font).Width));
                     focusRect.Inflate(1, -2);
                     ControlPaint.DrawFocusRectangle(e.Graphics, focusRect, textFore, BackColor);
+                }
+            }
+        }
+
+        internal sealed class ThemedRadioButton : RadioButton
+        {
+            private bool _dark;
+            private Color _surfaceBack;
+            private Color _textFore;
+
+            public ThemedRadioButton()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.UserPaint |
+                         ControlStyles.OptimizedDoubleBuffer |
+                         ControlStyles.ResizeRedraw |
+                         ControlStyles.SupportsTransparentBackColor, true);
+                AutoSize = true;
+                UseVisualStyleBackColor = false;
+                FlatStyle = FlatStyle.Flat;
+            }
+
+            public void ApplyPalette(bool dark, Color surfaceBack, Color textFore)
+            {
+                _dark = dark;
+                _surfaceBack = surfaceBack;
+                _textFore = textFore;
+                BackColor = surfaceBack;
+                ForeColor = textFore;
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            public override Size GetPreferredSize(Size proposedSize)
+            {
+                Size textSize = TextRenderer.MeasureText(Text ?? string.Empty, Font, new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                int width = 13 + 6 + textSize.Width + Padding.Horizontal + 2;
+                int height = Math.Max(13, textSize.Height) + Padding.Vertical;
+                return new Size(width, height);
+            }
+
+            protected override void SetBoundsCore(int x, int y, int width, int height, BoundsSpecified specified)
+            {
+                if (AutoSize)
+                {
+                    Size preferred = GetPreferredSize(Size.Empty);
+                    width = preferred.Width;
+                    height = preferred.Height;
+                }
+                base.SetBoundsCore(x, y, width, height, specified);
+            }
+
+            protected override void OnCheckedChanged(EventArgs e)
+            {
+                base.OnCheckedChanged(e);
+                Invalidate();
+            }
+
+            protected override void OnTextChanged(EventArgs e)
+            {
+                base.OnTextChanged(e);
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            protected override void OnFontChanged(EventArgs e)
+            {
+                base.OnFontChanged(e);
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            protected override void OnPaddingChanged(EventArgs e)
+            {
+                base.OnPaddingChanged(e);
+                if (AutoSize)
+                    Size = GetPreferredSize(Size.Empty);
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Color surface = _surfaceBack.IsEmpty ? BackColor : _surfaceBack;
+                Color text = _textFore.IsEmpty ? ForeColor : _textFore;
+                e.Graphics.Clear(surface);
+
+                bool enabled = Enabled;
+                Color border = _dark ? Color.FromArgb(104, 110, 120) : Color.FromArgb(150, 156, 166);
+                Color fill = _dark ? Color.FromArgb(36, 39, 44) : Color.FromArgb(250, 250, 250);
+                Color dot = _dark ? Color.FromArgb(238, 238, 238) : Color.FromArgb(46, 84, 140);
+                if (!enabled)
+                {
+                    text = Color.FromArgb(132, 136, 144);
+                    border = _dark ? Color.FromArgb(74, 80, 88) : Color.FromArgb(178, 182, 188);
+                    dot = Color.FromArgb(144, 148, 156);
+                }
+
+                int circleSize = 12;
+                int circleY = Math.Max(0, (ClientSize.Height - circleSize) / 2);
+                var circle = new Rectangle(0, circleY, circleSize, circleSize);
+                using (var fillBrush = new SolidBrush(fill))
+                    e.Graphics.FillEllipse(fillBrush, circle);
+                using (var borderPen = new Pen(border))
+                    e.Graphics.DrawEllipse(borderPen, circle);
+
+                if (Checked)
+                {
+                    var dotRect = new Rectangle(circle.Left + 3, circle.Top + 3, circle.Width - 6, circle.Height - 6);
+                    using var dotBrush = new SolidBrush(dot);
+                    e.Graphics.FillEllipse(dotBrush, dotRect);
+                }
+
+                Rectangle textRect = new Rectangle(circle.Right + 6, 0, Math.Max(0, ClientSize.Width - (circle.Right + 6)), ClientSize.Height);
+                TextRenderer.DrawText(e.Graphics, Text ?? string.Empty, Font, textRect, text,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+
+                if (Focused && ShowFocusCues)
+                {
+                    Rectangle focusRect = textRect;
+                    focusRect.Width = Math.Max(0, Math.Min(textRect.Width, TextRenderer.MeasureText(Text ?? string.Empty, Font).Width));
+                    focusRect.Inflate(1, -2);
+                    ControlPaint.DrawFocusRectangle(e.Graphics, focusRect, text, surface);
                 }
             }
         }
@@ -1587,7 +1719,7 @@ namespace PS2Disassembler
             {
                 if (IsLiveAttached() && _miBreakpointsSidebar != null)
                 {
-                    _miBreakpointsSidebar.Checked = !_miBreakpointsSidebar.Checked;
+                    ToggleBreakpointSidebarFromMenu();
                 }
                 return true;
             }
@@ -1901,6 +2033,7 @@ namespace PS2Disassembler
                 bool refreshRateChanged = _appSettings.RefreshRate != dlg.SelectedRefreshRate;
                 bool constantWriteRateChanged = _appSettings.ConstantWriteRate != dlg.SelectedConstantWriteRate;
                 bool memoryViewVisibilityChanged = _appSettings.ShowMemoryView != dlg.SelectedShowMemoryView;
+                bool codeDesignerVisibilityChanged = _appSettings.ShowCodeDesigner != dlg.SelectedShowCodeDesigner;
                 bool mainViewNavigationModeChanged = _appSettings.ShowTabsInTitleBar != dlg.SelectedShowTabsInTitleBar;
                 bool debugEndpointChanged = !string.Equals(_appSettings.DebugHost, dlg.SelectedDebugHost, StringComparison.OrdinalIgnoreCase)
                                          || _appSettings.PinePort != dlg.SelectedPinePort
@@ -1913,6 +2046,7 @@ namespace PS2Disassembler
                 _appSettings.RefreshRate = dlg.SelectedRefreshRate;
                 _appSettings.ConstantWriteRate = dlg.SelectedConstantWriteRate;
                 _appSettings.ShowMemoryView = dlg.SelectedShowMemoryView;
+                _appSettings.ShowCodeDesigner = dlg.SelectedShowCodeDesigner;
                 _appSettings.ShowTabsInTitleBar = dlg.SelectedShowTabsInTitleBar;
                 _appSettings.DebugHost = dlg.SelectedDebugHost;
                 _appSettings.PinePort = dlg.SelectedPinePort;
@@ -1941,6 +2075,9 @@ namespace PS2Disassembler
 
                 if (memoryViewVisibilityChanged)
                     ApplyMemoryViewVisibilitySetting();
+
+                if (codeDesignerVisibilityChanged)
+                    ApplyCodeDesignerVisibilitySetting();
 
                 if (themeChanged)
                 {
@@ -1978,6 +2115,18 @@ namespace PS2Disassembler
                 _miGoToMemoryView.Visible = showMemoryView;
 
             if (!showMemoryView && _mainTabs != null && _mainTabs.SelectedIndex == 1)
+                _mainTabs.SelectedIndex = 0;
+
+            SyncMainViewMenuState();
+        }
+
+        private void ApplyCodeDesignerVisibilitySetting()
+        {
+            bool showCodeDesigner = _appSettings?.ShowCodeDesigner ?? AppSettings.DefaultShowCodeDesigner;
+
+            _mainTabs?.SetTabVisible(3, showCodeDesigner);
+
+            if (!showCodeDesigner && _mainTabs != null && _mainTabs.SelectedIndex == 3)
                 _mainTabs.SelectedIndex = 0;
 
             SyncMainViewMenuState();

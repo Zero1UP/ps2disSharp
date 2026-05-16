@@ -1609,10 +1609,12 @@ namespace PS2Disassembler
                 ClearXrefResults();
                 QueueXrefAnalyzerAfterDisassembly(quiet: true, extendedCleanup: true);
                 StartDisassembly();
+                UpdateStartPanelVisibility();
             }
             catch (Exception ex)
             {
                 SetReadyStatus();
+                UpdateStartPanelVisibility();
                 MessageBox.Show($"Failed to load file:\n{ex.Message}", "ps2dis",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
@@ -1745,76 +1747,138 @@ namespace PS2Disassembler
             return unchecked(baseAddr + (uint)Math.Max(0, offset));
         }
 
+        private bool VisibleDisasmRangeContainsDataRows(int startRow, int endRow)
+        {
+            if (_rows.Count == 0)
+                return false;
+
+            startRow = Math.Max(0, startRow);
+            endRow = Math.Min(_rows.Count - 1, endRow);
+            for (int i = startRow; i <= endRow; i++)
+            {
+                if (_rows[i].DataSub != DataKind.None)
+                    return true;
+            }
+
+            return false;
+        }
+
         private bool TryUpdateVisibleDisassemblerRowsViaPine(VisibleLiveSnapshot? snapshot = null)
         {
             if (_fileData == null || _rows.Count == 0)
                 return false;
             if (_reinterpretNesting > 0)
                 return false;
-            if (!EnsurePineConnected())
+            if (!IsLiveAttached())
                 return false;
 
             if (!TryGetVisibleDisasmReadWindow(out int startRow, out int endRow, out int startOffset, out int readLength))
                 return false;
 
+            if (!TryReadVisibleDisasmWindow(startOffset, readLength, out byte[] data, out string source))
+                return false;
+
+            int copyLength = Math.Min(readLength, data.Length);
+            if (copyLength <= 0)
+                return false;
+
+            bool blockChanged = false;
+            for (int i = 0; i < copyLength; i++)
+            {
+                if (_fileData[startOffset + i] != data[i])
+                {
+                    blockChanged = true;
+                    break;
+                }
+            }
+
+            if (blockChanged)
+                Buffer.BlockCopy(data, 0, _fileData, startOffset, copyLength);
+
+            // Always reconcile the compact visible-row cache after a successful live read,
+            // even when this read did not change _fileData.  Other live/debugger paths can
+            // update _fileData first; if we only refreshed rows after this method's own
+            // BlockCopy, byte/data rows could keep painting old cached pixels until scroll
+            // or a manual reinterpret forced a redraw.
+            _lastVisibleDisasmChangeCount = RefreshVisibleDisassemblyRows(startRow, endRow);
+
+            bool hasVisibleDataRows = VisibleDisasmRangeContainsDataRows(startRow, endRow);
+            DateTime nowUtc = DateTime.UtcNow;
+            bool forceDataRowRepaint = hasVisibleDataRows && nowUtc >= _nextVisibleDataRowRepaintUtc;
+
+            if (blockChanged || _lastVisibleDisasmChangeCount > 0 || forceDataRowRepaint)
+            {
+                // Paint immediately when the row model or backing bytes actually changed.
+                // For visible data rows, keep the stale-pixel safety repaint from 0.0.133
+                // but cap that forced repaint to 10 Hz.  Repainting .byte/.half/.word rows
+                // synchronously every 30/60/100 Hz live tick was the main CPU regression.
+                _disasmList.RedrawItems(startRow, endRow, invalidateOnly: false);
+                _asciiBytesBar?.Invalidate();
+                _asciiBytesBar?.Update();
+                if (hasVisibleDataRows)
+                    _nextVisibleDataRowRepaintUtc = nowUtc.AddMilliseconds(VisibleDataRowRepaintIntervalMs);
+            }
+
+            if (_lastVisibleDisasmChangeCount > 0 || DateTime.UtcNow >= _nextPineVisibleReadLogUtc)
+            {
+                LogPine($"Live visible-row refresh ({source}) rows {startRow}-{endRow} @ 0x{OffsetToPineAddress(startOffset):X8}, len {readLength}, changed {_lastVisibleDisasmChangeCount}.");
+                _nextPineVisibleReadLogUtc = DateTime.UtcNow.AddSeconds(1);
+            }
+
+            return true;
+        }
+
+        private bool TryReadVisibleDisasmWindow(int startOffset, int readLength, out byte[] data, out string source)
+        {
+            data = Array.Empty<byte>();
+            source = string.Empty;
+
+            if (_fileData == null || startOffset < 0 || readLength <= 0 || startOffset >= _fileData.Length)
+                return false;
+
+            readLength = Math.Min(readLength, _fileData.Length - startOffset);
+            if (readLength <= 0)
+                return false;
+
+            uint address = OffsetToPineAddress(startOffset);
+            if (!TryBuildEeRamRange(address, (uint)readLength, out uint normalizedAddress, out _))
+                return false;
+
+            // Visible disassembly rows must reflect PCSX2 memory, even in low/kernel-ish
+            // regions.  Prefer direct process reads for display-only refreshes because older
+            // PINE paths can occasionally surface low memory as zero-filled data.  Direct
+            // reads are safe here because this path never writes and therefore cannot bypass
+            // PCSX2 recompiler invalidation.
+            if (TryReadEeMemoryDirect(normalizedAddress, readLength, out data) && data.Length >= readLength)
+            {
+                source = "direct";
+                return true;
+            }
+
+            if (!EnsurePineConnected())
+                return false;
+
             try
             {
-                byte[] data = _pine.ReadMemory(OffsetToPineAddress(startOffset), readLength);
-                if (data == null || data.Length <= 0)
+                byte[] pineData = _pine.ReadMemory(normalizedAddress, readLength);
+                if (pineData == null || pineData.Length <= 0)
                     return false;
 
-                int copyLength = Math.Min(readLength, data.Length);
-                bool blockChanged = false;
-                for (int i = 0; i < copyLength; i++)
-                {
-                    if (_fileData[startOffset + i] != data[i])
-                    {
-                        blockChanged = true;
-                        break;
-                    }
-                }
-
-                if (!blockChanged)
+                int copyLength = Math.Min(readLength, pineData.Length);
+                if (IsSuspiciousAllZeroPineRead(pineData, _fileData, startOffset, copyLength))
                 {
                     _lastVisibleDisasmChangeCount = 0;
-                }
-                else
-                {
-                    // Guard against PINE returning all-zeros for kernel/low memory
-                    if (IsSuspiciousAllZeroPineRead(data, _fileData, startOffset, copyLength))
-                    {
-                        _lastVisibleDisasmChangeCount = 0;
-                        return true;
-                    }
-                    Buffer.BlockCopy(data, 0, _fileData, startOffset, copyLength);
-                    _lastVisibleDisasmChangeCount = RefreshVisibleDisassemblyRows(startRow, endRow);
-
-                    if (_lastVisibleDisasmChangeCount > 0)
-                    {
-                        _disasmList.BeginUpdate();
-                        try
-                        {
-                            _disasmList.RedrawItems(startRow, endRow, true);
-                            _disasmList.Invalidate();
-                        }
-                        finally
-                        {
-                            _disasmList.EndUpdate();
-                        }
-                    }
+                    source = "PINE-zero-guard";
+                    return false;
                 }
 
-                if (_lastVisibleDisasmChangeCount > 0 || DateTime.UtcNow >= _nextPineVisibleReadLogUtc)
-                {
-                    LogPine($"Live visible-row refresh rows {startRow}-{endRow} @ 0x{OffsetToPineAddress(startOffset):X8}, len {readLength}, changed {_lastVisibleDisasmChangeCount}.");
-                    _nextPineVisibleReadLogUtc = DateTime.UtcNow.AddSeconds(1);
-                }
-
+                data = pineData;
+                source = "PINE";
                 return true;
             }
             catch (Exception ex)
             {
-                LogPine($"Live visible-row refresh failed at 0x{OffsetToPineAddress(startOffset):X8}, len {readLength}: {ex.Message}");
+                LogPine($"Live visible-row PINE read failed at 0x{normalizedAddress:X8}, len {readLength}: {ex.Message}");
                 _pine.Disconnect();
                 _pineAvailable = false;
                 _nextPineRetryUtc = DateTime.UtcNow.AddSeconds(1);
@@ -1944,52 +2008,429 @@ namespace PS2Disassembler
         {
             if (patches == null || patches.Count == 0)
                 return null;
-            LogPine($"Write request: {patches.Count} patch(es).");
+
+            int totalBytes = patches.Sum(p => p.Bytes?.Length ?? 0);
+            LogPine($"Write request: {patches.Count} patch(es), {totalBytes} byte(s).");
             if (!EnsurePineConnected())
                 return "PINE unavailable.";
 
-            const int VerifyCutoff = 256;
-            bool verifyWrites = patches.Count <= VerifyCutoff;
+            try
+            {
+                _pine.WritePatchesBatched(patches);
+            }
+            catch (Exception ex)
+            {
+                LogPine($"Batched PINE write failed: {ex.Message}");
+                try { _pine.Disconnect(); } catch { }
+                _pineAvailable = false;
+                return $"PINE write failed: {ex.Message}";
+            }
+
+            const int VerifyPatchCutoff = 256;
+            const int VerifyByteCutoff = 4096;
+            bool verifyWrites = patches.Count <= VerifyPatchCutoff && totalBytes <= VerifyByteCutoff;
             if (!verifyWrites)
-                LogPine($"Large PINE patch batch ({patches.Count} patch(es)); skipping per-patch readback verification.");
+            {
+                LogPine($"Large PINE patch batch ({patches.Count} patch(es), {totalBytes} byte(s)); skipping readback verification.");
+                return null;
+            }
 
             int failed = 0;
             foreach (var (addr, bytes) in patches)
             {
                 if (bytes == null || bytes.Length == 0)
                     continue;
+
                 try
                 {
-                    _pine.WriteMemory(addr, bytes);
-                    if (verifyWrites)
+                    byte[] verify;
+                    if (!TryReadLivePatchBytes(addr, bytes.Length, out verify))
+                        verify = _pine.ReadMemory(addr, bytes.Length);
+
+                    if (!verify.SequenceEqual(bytes))
                     {
-                        byte[] verify = _pine.ReadMemory(addr, bytes.Length);
-                        if (!verify.SequenceEqual(bytes))
-                        {
-                            failed++;
-                            LogPine($"Write verify mismatch at 0x{addr:X8}: wrote {BitConverter.ToString(bytes).Replace("-", "")} read {BitConverter.ToString(verify).Replace("-", "")}");
-                        }
-                        else
-                        {
-                            LogPine($"Write OK at 0x{addr:X8}: {BitConverter.ToString(bytes).Replace("-", "")}");
-                        }
+                        failed++;
+                        LogPine($"Write verify mismatch at 0x{addr:X8}: wrote {BitConverter.ToString(bytes).Replace("-", "")} read {BitConverter.ToString(verify).Replace("-", "")}");
+                    }
+                    else
+                    {
+                        LogPine($"Write OK at 0x{addr:X8}: {BitConverter.ToString(bytes).Replace("-", "")}");
                     }
                 }
                 catch (Exception ex)
                 {
                     failed++;
-                    LogPine($"Write failed at 0x{addr:X8}: {ex.Message}");
-                    _pine.Disconnect();
+                    LogPine($"Write verify failed at 0x{addr:X8}: {ex.Message}");
+                    try { _pine.Disconnect(); } catch { }
                     _pineAvailable = false;
                     break;
                 }
             }
 
-            return failed > 0 ? $"{failed} of {patches.Count} PINE write(s) failed." : null;
+            return failed > 0 ? $"{failed} of {patches.Count} PINE write(s) failed verification." : null;
+        }
+
+        private sealed class Pcsx2ProcessCandidate
+        {
+            public uint ProcessId { get; init; }
+            public string ProcessName { get; init; } = "";
+            public string WindowTitle { get; init; } = "";
+            public string Path { get; init; } = "";
+            public DateTime? StartedUtc { get; init; }
+        }
+
+        private static IReadOnlyList<Pcsx2ProcessCandidate> EnumeratePcsx2Instances()
+        {
+            var validNames = new[] { "pcsx2", "pcsx2-qt" };
+            var candidates = new List<Pcsx2ProcessCandidate>();
+
+            foreach (var proc in Process.GetProcesses())
+            {
+                try
+                {
+                    if (!validNames.Any(name => string.Equals(proc.ProcessName, name, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+
+                    string title = "";
+                    string path = "";
+                    DateTime? startedUtc = null;
+
+                    try { title = proc.MainWindowTitle ?? ""; } catch { }
+                    try { path = proc.MainModule?.FileName ?? ""; } catch { }
+                    try { startedUtc = proc.StartTime.ToUniversalTime(); } catch { }
+
+                    candidates.Add(new Pcsx2ProcessCandidate
+                    {
+                        ProcessId = (uint)proc.Id,
+                        ProcessName = proc.ProcessName,
+                        WindowTitle = title,
+                        Path = path,
+                        StartedUtc = startedUtc,
+                    });
+                }
+                catch
+                {
+                    // Processes can exit or deny individual properties while enumerating.
+                }
+                finally
+                {
+                    try { proc.Dispose(); } catch { }
+                }
+            }
+
+            return candidates
+                .OrderBy(p => p.ProcessName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(p => p.ProcessId)
+                .ToList();
+        }
+
+        private Pcsx2ProcessCandidate? SelectPcsx2ProcessForAttach()
+        {
+            var instances = EnumeratePcsx2Instances();
+            if (instances.Count == 0)
+            {
+                MessageBox.Show(this,
+                    "No PCSX2 process found.\n\nStart PCSX2 with a game loaded.",
+                    "Connect to PCSX2", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return null;
+            }
+
+            if (instances.Count == 1)
+                return instances[0];
+
+            using var dlg = new Pcsx2InstancePickerDialog(this, instances);
+            dlg.Load += (_, _) =>
+            {
+                dlg.ApplyThemeFromOwner();
+                ApplyScrollbarTheme(dlg, _currentTheme == AppTheme.Dark);
+                ApplyThemeToWindowChrome(dlg, forceFrameRefresh: true);
+            };
+            return dlg.ShowDialog(this) == DialogResult.OK ? dlg.SelectedProcess : null;
+        }
+
+        private sealed class Pcsx2InstancePickerDialog : Form
+        {
+            private readonly MainForm _owner;
+            private readonly List<Pcsx2ProcessCandidate> _instances;
+            private readonly VirtualDisasmList _list;
+            private readonly Button _connectButton;
+            private readonly Button _cancelButton;
+            private readonly Label _messageLabel;
+            private readonly FlowLayoutPanel _buttonPanel;
+            private readonly Font _listFont;
+            private Color _formBack;
+            private Color _formFore;
+            private Color _listBack;
+            private Color _listFore;
+            private Color _headerBack;
+            private Color _headerFore;
+            private Color _headerBorder;
+            private Color _selectedBack;
+            private Color _selectedFore;
+
+            public Pcsx2ProcessCandidate? SelectedProcess { get; private set; }
+
+            public Pcsx2InstancePickerDialog(MainForm owner, IReadOnlyList<Pcsx2ProcessCandidate> instances)
+            {
+                _owner = owner;
+                _instances = instances.ToList();
+                _listFont = owner._mono ?? owner.Font;
+
+                Text = "Select PCSX2 Instance";
+                StartPosition = FormStartPosition.CenterParent;
+                ShowIcon = false;
+                ShowInTaskbar = false;
+                MinimizeBox = false;
+                MaximizeBox = false;
+                Size = new Size(840, 360);
+                MinimumSize = new Size(620, 280);
+                Padding = new Padding(10);
+
+                _messageLabel = new Label
+                {
+                    Dock = DockStyle.Top,
+                    AutoSize = false,
+                    Height = 38,
+                    Text = "Multiple PCSX2 instances were detected. Double-click an instance, or select one and click Connect.",
+                    TextAlign = ContentAlignment.MiddleLeft,
+                };
+
+                _list = new VirtualDisasmList
+                {
+                    Dock = DockStyle.Fill,
+                    View = View.Details,
+                    FullRowSelect = true,
+                    MultiSelect = false,
+                    GridLines = false,
+                    Font = _listFont,
+                    HeaderStyle = ColumnHeaderStyle.Nonclickable,
+                    HeaderHeight = Math.Max(1, _listFont.Height + 6),
+                    RowHeight = Math.Max(1, _listFont.Height + 4),
+                    VirtualMode = true,
+                    OwnerDraw = true,
+                    BorderStyle = BorderStyle.None,
+                    AllowColumnResize = true,
+                };
+                _list.Columns.Add("PID", 80);
+                _list.Columns.Add("Process", 100);
+                _list.Columns.Add("Window Title", 260);
+                _list.Columns.Add("Started", 145);
+                _list.Columns.Add("Path", 240);
+                _list.VirtualListSize = _instances.Count;
+                _list.DrawHeader += OnDrawHeader;
+                _list.DrawCell += OnDrawCell;
+                _list.SelectedIndexChanged += (_, _) => UpdateConnectButton();
+                _list.MouseDoubleClick += OnListMouseDoubleClick;
+                _list.KeyDown += OnListKeyDown;
+                _list.Resize += (_, _) => UpdateColumnWidths();
+
+                _connectButton = new Button
+                {
+                    Text = "Connect",
+                    DialogResult = DialogResult.None,
+                    Width = 96,
+                    Height = 30,
+                    Anchor = AnchorStyles.Right | AnchorStyles.Top,
+                };
+                _connectButton.Click += (_, _) => AcceptSelection();
+
+                _cancelButton = new Button
+                {
+                    Text = "Cancel",
+                    DialogResult = DialogResult.Cancel,
+                    Width = 96,
+                    Height = 30,
+                    Anchor = AnchorStyles.Right | AnchorStyles.Top,
+                };
+
+                _buttonPanel = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Bottom,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Height = 42,
+                    Padding = new Padding(0, 8, 0, 0),
+                };
+                _buttonPanel.Controls.Add(_cancelButton);
+                _buttonPanel.Controls.Add(_connectButton);
+
+                Controls.Add(_list);
+                Controls.Add(_buttonPanel);
+                Controls.Add(_messageLabel);
+
+                AcceptButton = _connectButton;
+                CancelButton = _cancelButton;
+
+                Resize += (_, _) => UpdateColumnWidths();
+                Shown += (_, _) =>
+                {
+                    ApplyThemeFromOwner();
+                    UpdateColumnWidths();
+                };
+
+                if (_instances.Count > 0)
+                    _list.SelectedIndex = 0;
+
+                ApplyThemeFromOwner();
+                UpdateConnectButton();
+            }
+
+            public void ApplyThemeFromOwner()
+            {
+                bool dark = _owner._currentTheme == AppTheme.Dark;
+                _formBack = _owner._themeFormBack;
+                _formFore = _owner._themeFormFore;
+                _listBack = _owner._themeWindowBack;
+                _listFore = _owner._themeWindowFore;
+                _headerBack = _owner._headerBack;
+                _headerFore = _owner._headerFore;
+                _headerBorder = _owner._headerBorder;
+                _selectedBack = dark ? Color.FromArgb(58, 74, 98) : Color.FromArgb(0, 0, 128);
+                _selectedFore = Color.White;
+
+                BackColor = _formBack;
+                ForeColor = _formFore;
+                _messageLabel.BackColor = Color.Transparent;
+                _messageLabel.ForeColor = _formFore;
+                _buttonPanel.BackColor = _formBack;
+                _buttonPanel.ForeColor = _formFore;
+
+                ApplyButtonTheme(_connectButton);
+                ApplyButtonTheme(_cancelButton);
+
+                _list.BackColor = _listBack;
+                _list.ForeColor = _listFore;
+                _list.HeaderBackColor = _headerBack;
+                _list.HeaderBorderColor = _headerBorder;
+                _list.Invalidate();
+            }
+
+            private void ApplyButtonTheme(Button button)
+            {
+                Color buttonBack = BrightenColorByPercent(_headerBack, 1.20f);
+                Color buttonHover = BrightenColorByPercent(Color.FromArgb(
+                    Math.Min(255, _headerBack.R + 18),
+                    Math.Min(255, _headerBack.G + 18),
+                    Math.Min(255, _headerBack.B + 30)), 1.20f);
+                button.BackColor = buttonBack;
+                button.ForeColor = _headerFore;
+                button.UseVisualStyleBackColor = false;
+                button.FlatStyle = FlatStyle.Flat;
+                button.FlatAppearance.BorderColor = _headerBorder;
+                button.FlatAppearance.BorderSize = 1;
+                button.FlatAppearance.MouseOverBackColor = buttonHover;
+                button.FlatAppearance.MouseDownBackColor = Color.FromArgb(
+                    Math.Max(0, buttonBack.R - 10),
+                    Math.Max(0, buttonBack.G - 10),
+                    Math.Min(255, buttonBack.B + 40));
+            }
+
+            private void UpdateColumnWidths()
+            {
+                if (_list.Columns.Count < 5)
+                    return;
+
+                int contentWidth = Math.Max(0, _list.ClientSize.Width - (_list.HasVerticalScrollbar ? SystemInformation.VerticalScrollBarWidth : 0));
+                int pidWidth = 80;
+                int procWidth = 110;
+                int startedWidth = 150;
+                int pathWidth = Math.Max(180, contentWidth / 3);
+                int titleWidth = Math.Max(160, contentWidth - pidWidth - procWidth - startedWidth - pathWidth);
+
+                _list.Columns[0].Width = pidWidth;
+                _list.Columns[1].Width = procWidth;
+                _list.Columns[2].Width = titleWidth;
+                _list.Columns[3].Width = startedWidth;
+                _list.Columns[4].Width = pathWidth;
+                _list.Invalidate();
+            }
+
+            private void OnDrawHeader(object? sender, VirtualDisasmList.VirtualHeaderPaintEventArgs e)
+            {
+                using var bg = new SolidBrush(_headerBack);
+                e.Graphics.FillRectangle(bg, e.Bounds);
+                Rectangle textRect = Rectangle.Inflate(e.Bounds, -4, 0);
+                TextRenderer.DrawText(e.Graphics, e.Header.Text, _listFont, textRect, _headerFore,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+                using var pen = new Pen(_headerBorder);
+                e.Graphics.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+                e.Graphics.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+            }
+
+            private void OnDrawCell(object? sender, VirtualDisasmList.VirtualCellPaintEventArgs e)
+            {
+                if (e.ItemIndex < 0 || e.ItemIndex >= _instances.Count)
+                    return;
+
+                var instance = _instances[e.ItemIndex];
+                string started = instance.StartedUtc.HasValue
+                    ? instance.StartedUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+                    : "";
+                string text = e.ColumnIndex switch
+                {
+                    0 => instance.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    1 => instance.ProcessName,
+                    2 => string.IsNullOrWhiteSpace(instance.WindowTitle) ? "(no window title)" : instance.WindowTitle,
+                    3 => started,
+                    _ => instance.Path,
+                };
+
+                Color back = e.Selected ? _selectedBack : _listBack;
+                Color fore = e.Selected ? _selectedFore : _listFore;
+                using var bg = new SolidBrush(back);
+                e.Graphics.FillRectangle(bg, e.Bounds);
+                Rectangle textRect = Rectangle.Inflate(e.Bounds, -4, 0);
+                TextRenderer.DrawText(e.Graphics, text, _listFont, textRect, fore,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+            }
+
+            private void OnListMouseDoubleClick(object? sender, MouseEventArgs e)
+            {
+                var hit = _list.HitTest(e.Location);
+                if (hit.Item == null)
+                    return;
+
+                _list.SelectedIndex = hit.Item.Index;
+                AcceptSelection();
+            }
+
+            private void OnListKeyDown(object? sender, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    AcceptSelection();
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.Escape)
+                {
+                    DialogResult = DialogResult.Cancel;
+                    Close();
+                    e.Handled = true;
+                }
+            }
+
+            private void UpdateConnectButton()
+            {
+                _connectButton.Enabled = _list.SelectedIndex >= 0;
+            }
+
+            private void AcceptSelection()
+            {
+                int index = _list.SelectedIndex;
+                if (index < 0 || index >= _instances.Count)
+                    return;
+
+                SelectedProcess = _instances[index];
+                DialogResult = DialogResult.OK;
+                Close();
+            }
         }
 
         private void AttachToPcsx2()
         {
+            var selectedProcess = SelectPcsx2ProcessForAttach();
+            if (selectedProcess == null)
+                return;
+
             // Clear any existing file/dump data and live state before attaching,
             // so stale data from a previously-opened ELF/dump isn't shown.
             DetachFromPcsx2();
@@ -1998,6 +2439,8 @@ namespace PS2Disassembler
             _progressBar.Value   = 0;
             _progressBar.Visible = true;
             SetActivityStatus("Attaching to PCSX2...", 0);
+
+            uint requestedProcId = selectedProcess.ProcessId;
 
             Task.Run(() =>
             {
@@ -2009,7 +2452,7 @@ namespace PS2Disassembler
                 try
                 {
                     CaptureKernelWindowForPreservation();
-                    if (TryLocatePcsx2EeRam(out procId, out eeHostAddr, out errMsg))
+                    if (TryLocatePcsx2EeRam(requestedProcId, out procId, out eeHostAddr, out errMsg))
                     {
                         IntPtr hProc = NativeMethods.OpenProcess(
                             NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO,
@@ -2035,6 +2478,7 @@ namespace PS2Disassembler
                             "Attach to PCSX2", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         _sbProgress.Text = "Ready.";
                         SetReadyStatus();
+                        UpdateStartPanelVisibility();
                         return;
                     }
                     _liveProcId = procId;
@@ -2058,9 +2502,10 @@ namespace PS2Disassembler
                     _mainTabs.SetTabEnabled(2, true); // Enable Code Manager now that we're attached
                     _mainTabs.SetTabVisible(2, true);
                     SyncMainViewMenuState();
+                    UpdateStartPanelVisibility();
                     _sbProgress.Text = _debugServerAvailable
-                        ? (_pineAvailable ? "Attached to PCSX2 (PINE + debug server connected)." : "Attached to PCSX2 (debug server connected; PINE unavailable).")
-                        : (_pineAvailable ? "Attached to PCSX2 (PINE connected; debug server unavailable)." : "Attached to PCSX2 (PINE unavailable; using process memory).");
+                        ? (_pineAvailable ? $"Attached to PCSX2 PID {procId} (PINE + debug server connected)." : $"Attached to PCSX2 PID {procId} (debug server connected; PINE unavailable).")
+                        : (_pineAvailable ? $"Attached to PCSX2 PID {procId} (PINE connected; debug server unavailable)." : $"Attached to PCSX2 PID {procId} (PINE unavailable; using process memory).");
                     RefreshDebuggerUiTick(force: true);
                 });
             });
@@ -2189,38 +2634,43 @@ namespace PS2Disassembler
                     _menuStatusLabel.Font = _menuPauseStatusSavedFont;
             }
 
+            UpdateStartPanelVisibility();
+
             ForceManagedMemoryTrim();
             QueueManagedMemoryTrimBurst(extended: true);
         }
 
-        private bool TryLocatePcsx2EeRam(out uint procId, out long eeHostAddr, out string? errMsg)
+        private bool TryLocatePcsx2EeRam(uint requestedProcId, out uint procId, out long eeHostAddr, out string? errMsg)
         {
             procId = 0;
             eeHostAddr = 0;
-            var validNames = new[] { "pcsx2", "pcsx2-qt" };
 
-            var proc = Process.GetProcesses()
-                .FirstOrDefault(p => validNames.Any(name =>
-                    string.Equals(p.ProcessName, name, StringComparison.OrdinalIgnoreCase)));
-            if (proc == null)
+            if (requestedProcId == 0)
             {
-                errMsg = "No PCSX2 process found.\n\nStart PCSX2 with a game loaded.";
+                errMsg = "No PCSX2 process was selected.";
+                return false;
+            }
+
+            bool stillExists = EnumeratePcsx2Instances().Any(p => p.ProcessId == requestedProcId);
+            if (!stillExists)
+            {
+                errMsg = $"Selected PCSX2 process PID {requestedProcId} is no longer running.";
                 return false;
             }
 
             IntPtr hProc = NativeMethods.OpenProcess(
                 NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO,
-                false, (uint)proc.Id);
+                false, requestedProcId);
             if (hProc == IntPtr.Zero)
             {
-                errMsg = "Cannot open PCSX2. Try running ps2dis# as Administrator.";
+                errMsg = $"Cannot open PCSX2 PID {requestedProcId}. Try running ps2dis# as Administrator.";
                 return false;
             }
 
             try
             {
                 eeHostAddr = ResolveEeRamHostAddress(hProc, out errMsg);
-                procId = (uint)proc.Id;
+                procId = requestedProcId;
                 return eeHostAddr != 0;
             }
             finally
@@ -2818,11 +3268,15 @@ namespace PS2Disassembler
                 }
 
                 // Keep disassembly annotations and the ASCII byte bar live even when the breakpoint
-                // sidebar is closed. Annotation suffixes can dereference addresses outside the visible
-                // instruction-word window, so they must repaint every live tick whenever the
-                // Disassembler tab is active.
-                _disasmList?.Invalidate();
-                _asciiBytesBar?.Invalidate();
+                // sidebar is closed.  Cap this background annotation repaint to 10 Hz so higher
+                // PCSX2 refresh-rate settings do not multiply UI paint cost when nothing changed.
+                DateTime nowUtc = DateTime.UtcNow;
+                if (nowUtc >= _nextDisasmAnnotationRepaintUtc)
+                {
+                    _disasmList?.Invalidate();
+                    _asciiBytesBar?.Invalidate();
+                    _nextDisasmAnnotationRepaintUtc = nowUtc.AddMilliseconds(DisasmAnnotationRepaintIntervalMs);
+                }
 
                 bool frozen = _breakpointUiFrozen && _breakpointUiFrozenAddress.HasValue;
                 SetStatusText(frozen
@@ -2893,16 +3347,9 @@ namespace PS2Disassembler
             if (readLength <= 0)
                 return false;
 
-            if (startOffset < PreservedKernelWindowLength)
-            {
-                int safeStart = Math.Max(startOffset, PreservedKernelWindowLength);
-                int safeEnd = Math.Max(safeStart, endOffset);
-                startOffset = safeStart;
-                readLength = safeEnd - safeStart;
-                if (readLength <= 0)
-                    return false;
-            }
-
+            // Do not exclude the low/kernel window here.  The visible disassembler must
+            // update whichever rows are on-screen; the actual read path now uses a direct
+            // process-memory read first and only falls back to guarded PINE reads.
             return true;
         }
 
@@ -3010,7 +3457,7 @@ namespace PS2Disassembler
 
                 instrRows = ExpandStringLabeledByteRows(instrRows, data, baseAddr, startOff, endOff, stringRangesSnapshot);
                 instrRows = ExpandLabelAlignedRows(instrRows, data, baseAddr, startOff, endOff, userLabelsSnapshot, stringLabelsSnapshot);
-                ReclassifyIsolatedDataRowsAsInstructions(instrRows);
+                ReclassifyIsolatedDataRowsAsInstructions(instrRows, stringRangesSnapshot);
 
                 foreach (var row in instrRows)
                 {
@@ -3080,12 +3527,13 @@ namespace PS2Disassembler
         /// Also collapses 4 consecutive aligned .byte rows back into a single
         /// instruction row when the surrounding context is clearly code.
         /// </summary>
-        private static void ReclassifyIsolatedDataRowsAsInstructions(List<SlimRow> rows)
+        private static void ReclassifyIsolatedDataRowsAsInstructions(List<SlimRow> rows, IReadOnlyDictionary<uint, int>? protectedStringRanges = null)
         {
             if (rows.Count < 3)
                 return;
 
             const int windowRadius = 6;
+            var protectedRanges = BuildSortedAddressRanges(protectedStringRanges);
 
             // Helper: is this row a "real instruction"? (not data, not a padding nop of zero)
             static bool IsRealInstruction(SlimRow o)
@@ -3122,7 +3570,8 @@ namespace PS2Disassembler
                         i + 3 < rows.Count &&
                         rows[i + 1].DataSub == DataKind.Byte && rows[i + 1].Address == r.Address + 1 &&
                         rows[i + 2].DataSub == DataKind.Byte && rows[i + 2].Address == r.Address + 2 &&
-                        rows[i + 3].DataSub == DataKind.Byte && rows[i + 3].Address == r.Address + 3)
+                        rows[i + 3].DataSub == DataKind.Byte && rows[i + 3].Address == r.Address + 3 &&
+                        !AddressSpanOverlapsRanges(protectedRanges, r.Address, 4u))
                     {
                         // Count real instructions in surrounding window
                         int instrBefore = 0, instrAfter = 0;
@@ -3223,14 +3672,17 @@ namespace PS2Disassembler
 
         private static string FormatByteValue(byte value)
         {
-            char ch = value switch
+            string text = value switch
             {
-                >= 0x20 and <= 0x7E => (char)value,
-                0x00 => '\0',
-                _ => '·'
+                >= 0x20 and <= 0x7E => ((char)value).ToString(),
+                0x00 => "\\0",
+                0x09 => "\\t",
+                0x0A => "\\n",
+                0x0D => "\\r",
+                _ => "·"
             };
 
-            return ch.ToString();
+            return $"{text}({value})";
         }
 
         private static bool IsWholeWordByteRow(SlimRow row)
@@ -3269,7 +3721,7 @@ namespace PS2Disassembler
                 }
 
                 if (len > 0 && strStart + len < rangeEnd && data[strStart + len] == 0x00)
-                    ranges[addr] = len;
+                    ranges[addr] = len + 1; // include the null terminator so string byte rows stay protected
             }
 
             return ranges;
@@ -3283,67 +3735,164 @@ namespace PS2Disassembler
 
             int start = (int)Math.Min(startOff, (uint)data.Length);
             int end = (int)Math.Min(endOff, (uint)data.Length);
+            if (end <= start)
+                return rows;
+
+            var offsetRanges = BuildSortedOffsetRanges(stringRanges, baseAddr, start, end, data.Length);
+            if (offsetRanges.Count == 0)
+                return rows;
+
             bool needsExpansion = false;
             foreach (var row in rows)
             {
-                if (row.Kind == InstructionType.Data && stringRanges.TryGetValue(row.Address, out int stringLen) && stringLen > 0)
+                if (TryGetRowOffsetSpan(row, baseAddr, data.Length, out int rowStart, out int rowEnd) &&
+                    rowEnd > start && rowStart < end &&
+                    OffsetSpanOverlapsRanges(offsetRanges, rowStart, rowEnd))
                 {
-                    int rowOff = (int)(row.Address - baseAddr);
-                    if (rowOff >= start && rowOff < end)
-                    {
-                        needsExpansion = true;
-                        break;
-                    }
+                    needsExpansion = true;
+                    break;
                 }
             }
             if (!needsExpansion)
                 return rows;
 
             var expanded = new List<SlimRow>(rows.Count);
-
-            int rowIdx = 0;
-            while (rowIdx < rows.Count)
+            foreach (var row in rows)
             {
-                var row = rows[rowIdx];
-                if (!stringRanges.TryGetValue(row.Address, out int stringLen))
+                if (!TryGetRowOffsetSpan(row, baseAddr, data.Length, out int rowStart, out int rowEnd) ||
+                    rowEnd <= start || rowStart >= end ||
+                    !OffsetSpanOverlapsRanges(offsetRanges, rowStart, rowEnd))
                 {
                     expanded.Add(row);
-                    rowIdx++;
                     continue;
                 }
 
-                // Never convert instruction rows to bytes — only data rows should be expanded.
-                if (row.Kind != InstructionType.Data)
-                {
-                    expanded.Add(row);
-                    rowIdx++;
-                    continue;
-                }
-
-                int rowOff = (int)(row.Address - baseAddr);
-                if (rowOff < start || rowOff >= end || stringLen <= 0)
-                {
-                    expanded.Add(row);
-                    rowIdx++;
-                    continue;
-                }
-
-                int endByteExclusive = Math.Min(end, rowOff + stringLen);
-                for (int byteOff = rowOff; byteOff < endByteExclusive; byteOff++)
-                {
-                    byte value = data[byteOff];
-                    expanded.Add(SlimRow.DataRow(baseAddr + (uint)byteOff, value, DataKind.Byte));
-                }
-
-                int consumeUntil = ((endByteExclusive + 3) & ~3);
-                if (consumeUntil <= rowOff)
-                    consumeUntil = rowOff + 4;
-
-                while (rowIdx < rows.Count && (int)(rows[rowIdx].Address - baseAddr) < consumeUntil)
-                    rowIdx++;
+                // A verified null-terminated ASCII range is stronger evidence than an accidental
+                // valid-looking opcode.  Split the entire covered word/halfword into bytes so the
+                // string label lands on an actual .byte row and surrounding byte order stays visible.
+                int byteStart = Math.Max(start, rowStart);
+                int byteEnd = Math.Min(end, rowEnd);
+                for (int byteOff = byteStart; byteOff < byteEnd; byteOff++)
+                    expanded.Add(SlimRow.DataRow(baseAddr + (uint)byteOff, data[byteOff], DataKind.Byte));
             }
 
             return expanded;
+        }
+
+        private static bool TryGetRowOffsetSpan(SlimRow row, uint baseAddr, int dataLength, out int start, out int end)
+        {
+            start = 0;
+            end = 0;
+            long off = (long)row.Address - baseAddr;
+            if (off < 0 || off >= dataLength)
+                return false;
+
+            int span = row.DataSub switch
+            {
+                DataKind.Byte => 1,
+                DataKind.Half => 2,
+                _ => 4,
+            };
+
+            start = (int)off;
+            end = Math.Min(dataLength, start + span);
+            return end > start;
+        }
+
+        private static List<(int Start, int End)> BuildSortedOffsetRanges(IReadOnlyDictionary<uint, int> ranges, uint baseAddr,
+                                                                           int clipStart, int clipEnd, int dataLength)
+        {
+            var result = new List<(int Start, int End)>(ranges.Count);
+            foreach (var kv in ranges)
+            {
+                if (kv.Value <= 0)
+                    continue;
+
+                long start64 = (long)kv.Key - baseAddr;
+                long end64 = start64 + kv.Value;
+                if (end64 <= clipStart || start64 >= clipEnd || end64 <= 0 || start64 >= dataLength)
+                    continue;
+
+                int start = Math.Max(clipStart, (int)Math.Max(0, start64));
+                int end = Math.Min(clipEnd, (int)Math.Min(dataLength, end64));
+                if (end > start)
+                    result.Add((start, end));
+            }
+
+            result.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+            return result;
+        }
+
+        private static List<(uint Start, uint End)> BuildSortedAddressRanges(IReadOnlyDictionary<uint, int>? ranges)
+        {
+            var result = new List<(uint Start, uint End)>();
+            if (ranges == null || ranges.Count == 0)
+                return result;
+
+            result.Capacity = ranges.Count;
+            foreach (var kv in ranges)
+            {
+                if (kv.Value <= 0)
+                    continue;
+
+                uint start = kv.Key;
+                uint end = start + (uint)kv.Value;
+                if (end > start)
+                    result.Add((start, end));
+            }
+
+            result.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+            return result;
+        }
+
+        private static bool OffsetSpanOverlapsRanges(List<(int Start, int End)> ranges, int start, int end)
+        {
+            if (ranges.Count == 0 || end <= start)
+                return false;
+
+            int lo = 0;
+            int hi = ranges.Count - 1;
+            int first = ranges.Count;
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                if (ranges[mid].End <= start)
+                    lo = mid + 1;
+                else
+                {
+                    first = mid;
+                    hi = mid - 1;
+                }
+            }
+
+            return first < ranges.Count && ranges[first].Start < end;
+        }
+
+        private static bool AddressSpanOverlapsRanges(List<(uint Start, uint End)> ranges, uint start, uint size)
+        {
+            if (ranges.Count == 0 || size == 0)
+                return false;
+
+            uint end = start + size;
+            if (end <= start)
+                end = uint.MaxValue;
+
+            int lo = 0;
+            int hi = ranges.Count - 1;
+            int first = ranges.Count;
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                if (ranges[mid].End <= start)
+                    lo = mid + 1;
+                else
+                {
+                    first = mid;
+                    hi = mid - 1;
+                }
+            }
+
+            return first < ranges.Count && ranges[first].Start < end;
         }
 
         private static bool LooksLikeFloatWord(uint word)

@@ -257,7 +257,11 @@ namespace PS2Disassembler
                 return;
 
             start = Math.Max(start, _topIndex);
-            end = Math.Min(end, _topIndex + VisibleRowCapacity - 1);
+            // OnPaint intentionally renders one extra row because the bottom row can be
+            // partially visible.  RedrawItems must invalidate the same range; otherwise
+            // live-updated data in that trailing row can remain as old pixels until the
+            // user scrolls and forces a full repaint.
+            end = Math.Min(end, _topIndex + VisibleRowCapacity);
             if (start > end)
                 return;
 

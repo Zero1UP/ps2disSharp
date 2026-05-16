@@ -37,24 +37,20 @@ namespace PS2Disassembler
                         return buf;
                     },
                     applyLocal:  PatchFileDataAndRows,
-                    writePcsx2:  patches => WritePatchesToLivePcsx2(patches),
+                    writePcsx2:  (patches, safeCodePatch) => WritePatchesToLivePcsx2(patches, safeCodePatch: safeCodePatch),
                     readEeRam: () =>
                     {
-                        var validNames = new[] { "pcsx2", "pcsx2-qt" };
-
-                        var proc = Process.GetProcesses()
-                            .FirstOrDefault(p =>
-                                validNames.Any(name =>
-                                    string.Equals(p.ProcessName, name, StringComparison.OrdinalIgnoreCase)));
-                        if (proc == null) return (null, "PCSX2 process not found.");
+                        if (_liveProcId == 0 || _eeHostAddr == 0)
+                            return (null, "No attached PCSX2 process.");
 
                         uint access = NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO;
-                        IntPtr hProc = NativeMethods.OpenProcess(access, false, (uint)proc.Id);
-                        if (hProc == IntPtr.Zero) return (null, "Cannot open PCSX2 process.");
+                        IntPtr hProc = NativeMethods.OpenProcess(access, false, _liveProcId);
+                        if (hProc == IntPtr.Zero)
+                            return (null, $"Cannot open attached PCSX2 PID {_liveProcId}. Try running ps2dis# as Administrator.");
 
                         try
                         {
-                            var ram = ReadEeRamViaSymbol(hProc, out string? err);
+                            var ram = ReadEeRamFromAddress(hProc, _eeHostAddr, out string? err, null);
                             return (ram, err);
                         }
                         finally { NativeMethods.CloseHandle(hProc); }
@@ -149,7 +145,7 @@ namespace PS2Disassembler
                 _disasmList.RedrawItems(firstInvalid, lastInvalid, true);
         }
 
-        private string? WritePatchesToLivePcsx2(IReadOnlyList<(uint Addr, byte[] Bytes)> patches, int repeatWrites = 1)
+        private string? WritePatchesToLivePcsx2(IReadOnlyList<(uint Addr, byte[] Bytes)> patches, int repeatWrites = 1, bool safeCodePatch = false)
         {
             if (patches == null || patches.Count == 0)
                 return null;
@@ -159,7 +155,32 @@ namespace PS2Disassembler
                 return null;
 
             const int PauseBatchThreshold = 64;
+            const int PauseBatchByteThreshold = 256;
             const int DirectFallbackThreshold = 256;
+            const int DirectFallbackByteThreshold = 4096;
+
+            int totalPatchBytes = normalized.Sum(p => p.Bytes?.Length ?? 0);
+            bool shouldPauseForPatch = safeCodePatch ||
+                                       normalized.Count >= PauseBatchThreshold ||
+                                       totalPatchBytes >= PauseBatchByteThreshold;
+
+            var writeTargets = normalized;
+            if (safeCodePatch || totalPatchBytes >= PauseBatchByteThreshold)
+            {
+                writeTargets = FilterUnchangedLivePatches(normalized, out int skippedBytes);
+                if (skippedBytes > 0)
+                    LogPine($"Skipped {skippedBytes} unchanged live byte(s) before patching.");
+                if (writeTargets.Count == 0)
+                {
+                    LogPine("Patch Memory write skipped: PCSX2 memory already matched the requested bytes.");
+                    return null;
+                }
+
+                totalPatchBytes = writeTargets.Sum(p => p.Bytes?.Length ?? 0);
+                shouldPauseForPatch = safeCodePatch ||
+                                       writeTargets.Count >= PauseBatchThreshold ||
+                                       totalPatchBytes >= PauseBatchByteThreshold;
+            }
 
             bool resumeAfterPatch = false;
             bool pausedForPatch = false;
@@ -167,34 +188,131 @@ namespace PS2Disassembler
 
             try
             {
-                if (normalized.Count >= PauseBatchThreshold)
+                if (shouldPauseForPatch)
                 {
                     pausedForPatch = TryPauseVmForBulkPatch(out resumeAfterPatch, out pauseErr);
                     if (!pausedForPatch && !string.IsNullOrWhiteSpace(pauseErr))
                         LogPine($"Bulk patch pause skipped: {pauseErr}");
+
+                    if (safeCodePatch && !pausedForPatch)
+                    {
+                        return "PCSX2 is running and ps2dis# could not pause it safely before code injection. Pause PCSX2 manually or enable the PCSX2 debug server, then try Patch Memory again.";
+                    }
                 }
 
-                string? pineErr = TryWritePatchesViaPine(normalized);
+                string? pineErr = TryWritePatchesViaPine(writeTargets);
                 if (pineErr == null)
                     return null;
 
-                bool allowDirectFallback = normalized.Count < DirectFallbackThreshold;
+                if (safeCodePatch)
+                {
+                    LogPine($"Safe code patch write failed; direct fallback skipped to avoid stale PCSX2 recompiler code: {pineErr}");
+                    return pineErr;
+                }
+
+                bool allowDirectFallback = writeTargets.Count < DirectFallbackThreshold && totalPatchBytes < DirectFallbackByteThreshold;
                 if (!allowDirectFallback)
                 {
-                    LogPine($"PINE bulk write failed and direct fallback was skipped for safety ({normalized.Count} normalized patch(es)): {pineErr}");
+                    LogPine($"PINE bulk write failed and direct fallback was skipped for safety ({writeTargets.Count} normalized patch(es)): {pineErr}");
                     return pineErr;
                 }
 
                 LogPine($"Falling back to process memory writes: {pineErr}");
 
                 if (_liveProcId != 0 && _eeHostAddr != 0)
-                    return WritePatchesToPcsx2(_liveProcId, _eeHostAddr, normalized, repeatWrites);
+                    return WritePatchesToPcsx2(_liveProcId, _eeHostAddr, writeTargets, repeatWrites);
 
-                return WritePatchesToPcsx2(normalized, repeatWrites);
+                return WritePatchesToPcsx2(writeTargets, repeatWrites);
             }
             finally
             {
                 RestoreVmAfterBulkPatch(resumeAfterPatch);
+            }
+        }
+
+        private List<(uint Addr, byte[] Bytes)> FilterUnchangedLivePatches(IReadOnlyList<(uint Addr, byte[] Bytes)> patches, out int skippedBytes)
+        {
+            var changed = new List<(uint Addr, byte[] Bytes)>();
+            skippedBytes = 0;
+
+            foreach (var (addr, bytes) in patches)
+            {
+                if (bytes == null || bytes.Length == 0)
+                    continue;
+
+                if (!TryReadLivePatchBytes(addr, bytes.Length, out byte[] liveBytes) || liveBytes.Length < bytes.Length)
+                {
+                    changed.Add((addr, bytes));
+                    continue;
+                }
+
+                int before = changed.Sum(p => p.Bytes.Length);
+                AddChangedPatchSegments(addr, bytes, liveBytes, changed);
+                int after = changed.Sum(p => p.Bytes.Length);
+                skippedBytes += bytes.Length - Math.Max(0, after - before);
+            }
+
+            return NormalizePatches(changed);
+        }
+
+        private bool TryReadLivePatchBytes(uint address, int length, out byte[] data)
+        {
+            data = Array.Empty<byte>();
+            if (length <= 0)
+                return false;
+
+            if (!TryBuildEeRamRange(address, (uint)length, out uint normalizedAddress, out _))
+                return false;
+
+            if (_liveProcId != 0 && _eeHostAddr != 0 && TryReadEeMemoryDirect(normalizedAddress, length, out data) && data.Length >= length)
+                return true;
+
+            if (!EnsurePineConnected())
+                return false;
+
+            try
+            {
+                data = _pine.ReadMemory(normalizedAddress, length);
+                return data.Length >= length;
+            }
+            catch (Exception ex)
+            {
+                LogPine($"Live patch read failed at 0x{normalizedAddress:X8}: {ex.Message}");
+                try { _pine.Disconnect(); } catch { }
+                _pineAvailable = false;
+                data = Array.Empty<byte>();
+                return false;
+            }
+        }
+
+        private static void AddChangedPatchSegments(uint baseAddress, byte[] desiredBytes, byte[] liveBytes, List<(uint Addr, byte[] Bytes)> changed)
+        {
+            int segmentStart = -1;
+
+            for (int i = 0; i < desiredBytes.Length; i++)
+            {
+                bool byteChanged = i >= liveBytes.Length || desiredBytes[i] != liveBytes[i];
+                if (byteChanged)
+                {
+                    if (segmentStart < 0)
+                        segmentStart = i;
+                }
+                else if (segmentStart >= 0)
+                {
+                    int length = i - segmentStart;
+                    var segment = new byte[length];
+                    Buffer.BlockCopy(desiredBytes, segmentStart, segment, 0, length);
+                    changed.Add((baseAddress + (uint)segmentStart, segment));
+                    segmentStart = -1;
+                }
+            }
+
+            if (segmentStart >= 0)
+            {
+                int length = desiredBytes.Length - segmentStart;
+                var segment = new byte[length];
+                Buffer.BlockCopy(desiredBytes, segmentStart, segment, 0, length);
+                changed.Add((baseAddress + (uint)segmentStart, segment));
             }
         }
 
@@ -203,11 +321,16 @@ namespace PS2Disassembler
             resumeAfter = false;
             error = null;
 
+            if (TryGetPineVmPaused(out bool pinePaused, out string? pineStatusError) && pinePaused)
+                return true;
+
             try
             {
                 if (!EnsureDebugServerConnected(forceRetry: true))
                 {
-                    error = $"Debug server not available on port {_debugServer.Port}.";
+                    error = !string.IsNullOrWhiteSpace(pineStatusError)
+                        ? $"Debug server not available on port {_debugServer.Port}; PINE status check: {pineStatusError}"
+                        : $"Debug server not available on port {_debugServer.Port}.";
                     return false;
                 }
 
@@ -233,6 +356,39 @@ namespace PS2Disassembler
             {
                 try { _debugServer.Disconnect(); } catch { }
                 _debugServerAvailable = false;
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private bool TryGetPineVmPaused(out bool paused, out string? error)
+        {
+            paused = false;
+            error = null;
+
+            try
+            {
+                if (!EnsurePineConnected())
+                {
+                    error = "PINE unavailable.";
+                    return false;
+                }
+
+                uint status = _pine.GetStatusSafe();
+                if (status == 1u)
+                {
+                    paused = true;
+                    return true;
+                }
+
+                if (status == 0u)
+                    return true;
+
+                error = status == 2u ? "VM is shutdown." : $"unknown VM status 0x{status:X8}.";
+                return false;
+            }
+            catch (Exception ex)
+            {
                 error = ex.Message;
                 return false;
             }
@@ -691,31 +847,51 @@ namespace PS2Disassembler
             _cachedLabels = list.GroupBy(x => x.Address).Select(g => g.Last()).OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ThenBy(x => x.Address).ToList();
         }
 
-        private void ScanStringLabels()
+        private static Dictionary<uint, string> BuildStringLabelMap(byte[] data, uint baseAddr)
         {
-            _stringLabels = new Dictionary<uint, string>();
-            if (_fileData == null) return;
+            var labels = new Dictionary<uint, string>();
+            if (data == null || data.Length == 0) return labels;
+
             const int MinLen = 4, MaxShow = 48;
             int i = 0;
-            while (i < _fileData.Length)
+            while (i < data.Length)
             {
-                byte b = _fileData[i];
+                byte b = data[i];
                 if (b >= 0x20 && b <= 0x7E)
                 {
                     int start = i;
-                    while (i < _fileData.Length && _fileData[i] >= 0x20 && _fileData[i] <= 0x7E) i++;
+                    while (i < data.Length && data[i] >= 0x20 && data[i] <= 0x7E) i++;
                     int len = i - start;
-                    if (len >= MinLen && i < _fileData.Length && _fileData[i] == 0x00)
+                    if (len >= MinLen && i < data.Length && data[i] == 0x00)
                     {
-                        string text = System.Text.Encoding.ASCII.GetString(_fileData, start, Math.Min(len, MaxShow));
+                        string text = System.Text.Encoding.ASCII.GetString(data, start, Math.Min(len, MaxShow));
                         if (len > MaxShow) text += "…";
-                        uint addr = _baseAddr + (uint)start;
-                        if (!_stringLabels.ContainsKey(addr))
-                            _stringLabels[addr] = $"\"{text}\"";
+                        uint addr = baseAddr + (uint)start;
+                        if (!labels.ContainsKey(addr))
+                            labels[addr] = $"\"{text}\"";
                     }
                 }
                 else i++;
             }
+
+            return labels;
+        }
+
+        private void ScanStringLabels()
+        {
+            _stringLabels = _fileData == null
+                ? new Dictionary<uint, string>()
+                : BuildStringLabelMap(_fileData, _baseAddr);
+            RebuildLabelCache();
+        }
+
+        private void ReplaceTemporaryAnalyzerLabelsFromData(byte[] data, uint baseAddr)
+        {
+            _stringLabels = BuildStringLabelMap(data, baseAddr);
+            _autoLabels = new Dictionary<uint, string>();
+            _cachedDisasm = null;
+            _addrToRow = null;
+            _addrIndexDirty = true;
             RebuildLabelCache();
         }
 
@@ -1011,8 +1187,28 @@ namespace PS2Disassembler
         private static bool TryParseInlineByteValue(string text, out uint value)
         {
             text = text.Trim();
+
             int paren = text.IndexOf('(');
-            if (paren >= 0) text = text[..paren].Trim();
+            if (paren >= 0)
+            {
+                int close = text.IndexOf(')', paren + 1);
+                string decimalPart = close > paren
+                    ? text.Substring(paren + 1, close - paren - 1).Trim()
+                    : text[(paren + 1)..].Trim();
+                if (byte.TryParse(decimalPart, System.Globalization.NumberStyles.Integer, null, out byte annotatedByte))
+                {
+                    value = annotatedByte;
+                    return true;
+                }
+
+                text = text[..paren].Trim();
+            }
+
+            if (text == "\\0") { value = 0; return true; }
+            if (text == "\\t") { value = 0x09; return true; }
+            if (text == "\\n") { value = 0x0A; return true; }
+            if (text == "\\r") { value = 0x0D; return true; }
+
             if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) text = text[2..];
             if (byte.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out byte b))
             {
@@ -1940,7 +2136,7 @@ namespace PS2Disassembler
         // ── Codes / inject tab fields ─────────────────────────────────────
         private readonly Func<uint, int, byte[]?>                               _read;
         private readonly Action<IReadOnlyList<(uint Addr, byte[] Bytes)>>        _applyLocal;
-        private readonly Func<IReadOnlyList<(uint Addr, byte[] Bytes)>, string?> _writePcsx2;
+        private readonly Func<IReadOnlyList<(uint Addr, byte[] Bytes)>, bool, string?> _writePcsx2;
         private readonly RichTextBox _tbCodes;
         private readonly RichTextBox _tbInject;
         private Label? _lblEnterCodes;
@@ -1982,7 +2178,7 @@ namespace PS2Disassembler
         public CodeToolsDialog(
             Func<uint, int, byte[]?> read,
             Action<IReadOnlyList<(uint Addr, byte[] Bytes)>> applyLocal,
-            Func<IReadOnlyList<(uint Addr, byte[] Bytes)>, string?> writePcsx2,
+            Func<IReadOnlyList<(uint Addr, byte[] Bytes)>, bool, string?> writePcsx2,
             Func<(byte[]?, string?)> readEeRam,
             Action<uint> navigateToCenter)
         {
@@ -2035,7 +2231,7 @@ namespace PS2Disassembler
             };
             codesSurface.Controls.Add(_lblEnterCodes);
             const int rtbPad = 4; // visual padding around the RichTextBox
-            _tbCodes = new RichTextBox
+            _tbCodes = new CodeDesignerRichTextBox
             {
                 Location = new Point(pad + rtbPad, pad + 20 + rtbPad),
                 Size = new Size(Math.Max(120, tpCodes.ClientSize.Width - (pad * 2) - (rtbPad * 2)), Math.Max(80, tpCodes.ClientSize.Height - (pad + 20) - btnH - (pad * 2) - (rtbPad * 2))),
@@ -2046,7 +2242,8 @@ namespace PS2Disassembler
                 WordWrap = false,
                 AcceptsTab = true,
                 BorderStyle = BorderStyle.None,
-                DetectUrls = false
+                DetectUrls = false,
+                AutoWordSelection = false
             };
             codesSurface.Controls.Add(_tbCodes);
             _tbCodes.ContextMenuStrip = CreateEditorContextMenu(_tbCodes);
@@ -2079,7 +2276,7 @@ namespace PS2Disassembler
             var injectSurface = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0), Margin = new Padding(0), Tag = "CodeManagerSurface", BackColor = Color.FromArgb(24, 27, 31) };
             tpInject.Controls.Add(injectSurface);
             injectSurface.Controls.Add(new Label { Text = "Enter Codes", Location = new Point(pad, pad), AutoSize = true });
-            _tbInject = new RichTextBox
+            _tbInject = new CodeDesignerRichTextBox
             {
                 Location = new Point(pad + rtbPad, pad + 20 + rtbPad),
                 Size = new Size(Math.Max(120, tpInject.ClientSize.Width - (pad * 2) - (rtbPad * 2)), Math.Max(80, tpInject.ClientSize.Height - (pad + 20) - btnH - (pad * 2) - (rtbPad * 2))),
@@ -2090,7 +2287,8 @@ namespace PS2Disassembler
                 WordWrap = false,
                 AcceptsTab = true,
                 BorderStyle = BorderStyle.None,
-                DetectUrls = false
+                DetectUrls = false,
+                AutoWordSelection = false
             };
             injectSurface.Controls.Add(_tbInject);
             _tbInject.ContextMenuStrip = CreateEditorContextMenu(_tbInject);
@@ -2107,7 +2305,7 @@ namespace PS2Disassembler
                 Location = new Point(pad, tpInject.ClientSize.Height - btnH - pad),
                 Anchor = AnchorStyles.Left | AnchorStyles.Bottom
             };
-            btnUpdateInject.Click += (_, _) => ApplyCodes(_tbInject, clearAfterApply: true, probeReadable: false);
+            btnUpdateInject.Click += (_, _) => ApplyCodes(_tbInject, clearAfterApply: true, probeReadable: false, safeCodePatch: true);
             injectSurface.Controls.Add(btnUpdateInject);
             var lblInjectSupport = new Label
             {
@@ -2361,15 +2559,15 @@ namespace PS2Disassembler
             ApplyParsedPatches(patches, clearEditorAfterApply: false, editorToClear: null, showMessage: showMessage, applied: applied, skipped: skipped);
         }
 
-        private void ApplyCodes(TextBoxBase source, bool clearAfterApply, bool showMessage = true, bool probeReadable = true)
+        private void ApplyCodes(TextBoxBase source, bool clearAfterApply, bool showMessage = true, bool probeReadable = true, bool safeCodePatch = false)
         {
-            ApplyCodesText(source.Text, clearAfterApply, source, showMessage, probeReadable);
+            ApplyCodesText(source.Text, clearAfterApply, source, showMessage, probeReadable, safeCodePatch);
         }
 
-        private void ApplyCodesText(string sourceText, bool clearEditorAfterApply, TextBoxBase? editorToClear, bool showMessage = true, bool probeReadable = true)
+        private void ApplyCodesText(string sourceText, bool clearEditorAfterApply, TextBoxBase? editorToClear, bool showMessage = true, bool probeReadable = true, bool safeCodePatch = false)
         {
             var patches = ParseCodesText(sourceText, out int applied, out int skipped, probeReadable);
-            ApplyParsedPatches(patches, clearEditorAfterApply, editorToClear, showMessage, applied, skipped);
+            ApplyParsedPatches(patches, clearEditorAfterApply, editorToClear, showMessage, applied, skipped, safeCodePatch);
         }
 
         private List<(uint Addr, byte[] Bytes)> ParseCodesText(string sourceText, out int applied, out int skipped, bool probeReadable = true)
@@ -2462,12 +2660,12 @@ namespace PS2Disassembler
             return patches;
         }
 
-        private void ApplyParsedPatches(IReadOnlyList<(uint Addr, byte[] Bytes)> patches, bool clearEditorAfterApply, TextBoxBase? editorToClear, bool showMessage = true, int applied = 0, int skipped = 0)
+        private void ApplyParsedPatches(IReadOnlyList<(uint Addr, byte[] Bytes)> patches, bool clearEditorAfterApply, TextBoxBase? editorToClear, bool showMessage = true, int applied = 0, int skipped = 0, bool safeCodePatch = false)
         {
             if (patches.Count > 0)
             {
                 _applyLocal(patches);
-                string? pcsx2Err = _writePcsx2(patches);
+                string? pcsx2Err = _writePcsx2(patches, safeCodePatch);
                 if (pcsx2Err != null && showMessage)
                     MessageBox.Show($"Local disassembly updated, but PCSX2 write failed:\r\n{pcsx2Err}",
                         "GameShark Tools", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -2975,7 +3173,7 @@ namespace PS2Disassembler
         public FindDialog()
         {
             Text = "Find";
-            ClientSize = new Size(410, 160);
+            ClientSize = new Size(410, 184);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -3010,11 +3208,19 @@ namespace PS2Disassembler
                 Size = new Size(190, 56),
             };
 
-            _rbString = new RadioButton { Text = "String", Location = new Point(12, 18), AutoSize = true, Checked = true };
-            _rbHex = new RadioButton { Text = "Hex Pattern", Location = new Point(12, 36), AutoSize = true };
+            _rbString = new MainForm.ThemedRadioButton { Text = "String", Location = new Point(12, 18), AutoSize = true, Checked = true };
+            _rbHex = new MainForm.ThemedRadioButton { Text = "Hex Pattern", Location = new Point(12, 36), AutoSize = true };
             gbMode.Controls.Add(_rbString);
             gbMode.Controls.Add(_rbHex);
             Controls.Add(gbMode);
+
+            var lblF5 = new Label
+            {
+                Text = "Press F5 to find next",
+                Location = new Point(14, 121),
+                AutoSize = true,
+            };
+            Controls.Add(lblF5);
 
             _rbString.CheckedChanged += (_, _) => _chkCaseSensitive.Enabled = _rbString.Checked;
 
@@ -3026,7 +3232,7 @@ namespace PS2Disassembler
             var btnFind = new Button
             {
                 Text = "Find Next",
-                Location = new Point(310, 128),
+                Location = new Point(310, 150),
                 Width = 88,
                 Height = 26,
                 FlatStyle = FlatStyle.Flat,
@@ -3046,6 +3252,11 @@ namespace PS2Disassembler
                 Close();
                 return true;
             }
+            if (keyData == Keys.F5)
+            {
+                FindNext?.Invoke(this, EventArgs.Empty);
+                return true;
+            }
             return base.ProcessCmdKey(ref msg, keyData);
         }
     }
@@ -3059,6 +3270,7 @@ namespace PS2Disassembler
         private readonly MainForm.FlatComboBox _cbRefreshRate;
         private readonly MainForm.FlatComboBox _cbConstantWriteRate;
         private readonly CheckBox _chkShowMemoryView;
+        private readonly CheckBox _chkShowCodeDesigner;
         private readonly CheckBox _chkShowTabsInTitleBar;
         private readonly TextBox _tbDebugHost;
         private readonly TextBox _tbPinePort;
@@ -3080,6 +3292,7 @@ namespace PS2Disassembler
             ? v
             : AppSettings.DefaultConstantWriteRate;
         public bool SelectedShowMemoryView => _chkShowMemoryView.Checked;
+        public bool SelectedShowCodeDesigner => _chkShowCodeDesigner.Checked;
         public bool SelectedShowTabsInTitleBar => _chkShowTabsInTitleBar.Checked;
         public string SelectedDebugHost => AppSettings.NormalizeDebugHost(_tbDebugHost.Text);
         public int SelectedPinePort => ParsePort(_tbPinePort.Text, AppSettings.DefaultPinePort);
@@ -3092,7 +3305,7 @@ namespace PS2Disassembler
             const int optionsButtonStripHeight = 42;
             const int optionsTabStripHeight = 24;
             const int optionsContentBottomPadding = 12;
-            const int optionsContentHeight = 190 + 2 + 20 + optionsContentBottomPadding;
+            const int optionsContentHeight = 224 + 2 + 20 + optionsContentBottomPadding;
             Size optionsClientSize = new Size(optionsTabCount * optionsTabButtonWidth, optionsTabStripHeight + optionsContentHeight + optionsButtonStripHeight);
 
             Text = $"Options - Version {AppSettings.AppVersion}";
@@ -3227,7 +3440,18 @@ namespace PS2Disassembler
             };
             pnlUi.Controls.Add(_chkShowMemoryView);
 
-            int showTabsInTitleBarRowY = showMemoryRowY + rowH;
+            int showCodeDesignerRowY = showMemoryRowY + rowH;
+            _chkShowCodeDesigner = new MainForm.ThemedCheckBox
+            {
+                Text = "Show Code Designer",
+                Location = new Point(innerLabelX, showCodeDesignerRowY + 2),
+                AutoSize = true,
+                Checked = settings.ShowCodeDesigner,
+                TabStop = true,
+            };
+            pnlUi.Controls.Add(_chkShowCodeDesigner);
+
+            int showTabsInTitleBarRowY = showCodeDesignerRowY + rowH;
             _chkShowTabsInTitleBar = new MainForm.ThemedCheckBox
             {
                 Text = "Show Tabs in Title Bar",
@@ -3336,6 +3560,7 @@ namespace PS2Disassembler
                     AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     AppSettings.DefaultConstantWriteRate.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 _chkShowMemoryView.Checked = AppSettings.DefaultShowMemoryView;
+                _chkShowCodeDesigner.Checked = AppSettings.DefaultShowCodeDesigner;
                 _chkShowTabsInTitleBar.Checked = AppSettings.DefaultShowTabsInTitleBar;
                 _tbDebugHost.Text = AppSettings.DefaultDebugHost;
                 _tbPinePort.Text = AppSettings.DefaultPinePort.ToString(System.Globalization.CultureInfo.InvariantCulture);

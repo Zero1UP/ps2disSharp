@@ -579,6 +579,8 @@ namespace PS2Disassembler
                     return ApplyObjectLabelDefinitions(defs, showDialogs: false);
                 };
                 _labelsWindow.NavigateToAddressCallback = NavigateToAddressFromLabelsWindow;
+                _labelsWindow.GetObjectRuntimeAddressCallback = ResolveObjectLabelRuntimeAddress;
+                _labelsWindow.PrepareOwnedWindowCallback = PrepareLabelsOwnedWindow;
                 _labelsWindow.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
                 _labelsWindow.Load += (sender, _) =>
                 {
@@ -604,6 +606,8 @@ namespace PS2Disassembler
                     return ApplyObjectLabelDefinitions(defs, showDialogs: false);
                 };
                 _labelsWindow.NavigateToAddressCallback = NavigateToAddressFromLabelsWindow;
+                _labelsWindow.GetObjectRuntimeAddressCallback = ResolveObjectLabelRuntimeAddress;
+                _labelsWindow.PrepareOwnedWindowCallback = PrepareLabelsOwnedWindow;
                 _labelsWindow.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
                 if (!_labelsWindow.Visible)
                 {
@@ -630,6 +634,24 @@ namespace PS2Disassembler
         }
 
 
+        private void PrepareLabelsOwnedWindow(Form child)
+        {
+            if (child == null || child.IsDisposed)
+                return;
+
+            child.StartPosition = FormStartPosition.Manual;
+            Rectangle ownerBounds = Bounds;
+            Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+            int x = ownerBounds.Left + Math.Max(0, (ownerBounds.Width - child.Width) / 2);
+            int y = ownerBounds.Top + Math.Max(0, (ownerBounds.Height - child.Height) / 2);
+            x = Math.Min(Math.Max(workingArea.Left, x), Math.Max(workingArea.Left, workingArea.Right - child.Width));
+            y = Math.Min(Math.Max(workingArea.Top, y), Math.Max(workingArea.Top, workingArea.Bottom - child.Height));
+            child.Location = new Point(x, y);
+
+            child.Load += (_, _) => ApplyThemeToWindowChrome(child, forceFrameRefresh: true);
+            child.Shown += (_, _) => ApplyThemeToWindowChrome(child, forceFrameRefresh: true);
+        }
+
         private void CenterLabelsWindow()
         {
             if (_labelsWindow == null || _labelsWindow.IsDisposed)
@@ -655,6 +677,14 @@ namespace PS2Disassembler
             MessageBox.Show($"${addr:X8} is outside the file range.", "ps2dis");
         }
 
+        private uint? ResolveObjectLabelRuntimeAddress(ObjectLabelDefinition definition)
+        {
+            if (TryGetActiveObjectRuntimeAddress(definition, out uint objectAddress))
+                return objectAddress;
+
+            return null;
+        }
+
         private void SyncLabelsWindowObjectTabVisibility()
         {
             if (_labelsWindow == null || _labelsWindow.IsDisposed)
@@ -663,6 +693,259 @@ namespace PS2Disassembler
             _labelsWindow.SetShowObjectLabels(ShouldShowObjectLabelsTab());
             _labelsWindow.SetData(_cachedLabels, _objectLabelDefinitions, ShouldShowObjectLabelsTab());
             _labelsWindow.ApplyThemeColors(_themeFormBack, _themeFormFore, _themeWindowBack, _themeWindowFore, _currentTheme == AppTheme.Dark);
+        }
+    }
+
+    internal sealed class ObjectLabelViewDialog : Form
+    {
+        private sealed class ObjectViewRow
+        {
+            public uint Address { get; init; }
+            public uint Offset { get; init; }
+            public string Label { get; init; } = string.Empty;
+        }
+
+        public Action<uint>? NavigateToAddressCallback { get; set; }
+
+        private readonly List<ObjectViewRow> _rows = new List<ObjectViewRow>();
+        private readonly VirtualDisasmList? _list;
+        private readonly Label? _invalidLabel;
+        private readonly Font _listFont = new Font("Courier New", 9f);
+
+        private Color _windowBack = Color.White;
+        private Color _windowFore = Color.Black;
+        private Color _selBack = Color.FromArgb(0, 0, 128);
+        private Color _selFore = Color.White;
+        private Color _headerBack = SystemColors.Control;
+        private Color _headerFore = SystemColors.ControlText;
+        private Color _headerBorder = SystemColors.ControlDark;
+        private Color _formBack = SystemColors.Control;
+        private Color _formFore = SystemColors.ControlText;
+
+        public ObjectLabelViewDialog(ObjectLabelDefinition definition, uint? objectAddress)
+        {
+            if (definition == null)
+                throw new ArgumentNullException(nameof(definition));
+
+            string titleLabel = string.IsNullOrWhiteSpace(definition.Label) ? "Object" : definition.Label.Trim();
+            Text = $"{titleLabel}: {definition.StaticAddress:X8}";
+            Size = new Size(520, 360);
+            MinimumSize = new Size(360, 220);
+            FormBorderStyle = FormBorderStyle.Sizable;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            MinimizeBox = false;
+            Font = new Font("Tahoma", 8.25f);
+            KeyPreview = true;
+
+            if (objectAddress.HasValue)
+            {
+                foreach (ObjectLabelField field in definition.Fields
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Label))
+                    .OrderBy(x => x.Offset))
+                {
+                    uint fieldAddress = objectAddress.Value + field.Offset;
+                    if (fieldAddress < objectAddress.Value)
+                        continue;
+
+                    _rows.Add(new ObjectViewRow
+                    {
+                        Address = fieldAddress,
+                        Offset = field.Offset,
+                        Label = field.Label.Trim(),
+                    });
+                }
+
+                _list = CreateList();
+                _list.Dock = DockStyle.Fill;
+                _list.Columns.Add("Address", MeasureCharacterColumnWidth(9));
+                _list.Columns.Add("Offset", MeasureCharacterColumnWidth(9));
+                _list.Columns.Add("Label", 220);
+                _list.VirtualListSize = _rows.Count;
+                _list.DrawCell += OnDrawCell;
+                _list.DrawHeader += OnDrawHeader;
+                _list.SelectedIndexChanged += (_, _) => _list.Invalidate();
+                _list.MouseDoubleClick += OnListMouseDoubleClick;
+                _list.KeyDown += OnListKeyDown;
+                if (_rows.Count > 0)
+                    _list.SelectedIndices.Add(0);
+                Controls.Add(_list);
+            }
+            else
+            {
+                _invalidLabel = new Label
+                {
+                    Dock = DockStyle.Fill,
+                    Text = "Object is invalid",
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    AutoSize = false,
+                };
+                Controls.Add(_invalidLabel);
+            }
+
+            Resize += (_, _) => UpdateColumnWidths();
+            Shown += (_, _) => UpdateColumnWidths();
+            KeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    Close();
+                    e.Handled = true;
+                }
+            };
+        }
+
+        private VirtualDisasmList CreateList()
+        {
+            var list = new VirtualDisasmList
+            {
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = false,
+                Font = _listFont,
+                MultiSelect = false,
+                VirtualMode = true,
+                OwnerDraw = true,
+                BorderStyle = BorderStyle.None,
+                HeaderStyle = ColumnHeaderStyle.Nonclickable,
+                AllowColumnResize = false,
+            };
+            list.RowHeight = Math.Max(1, _listFont.Height + 4);
+            list.HeaderHeight = Math.Max(1, _listFont.Height + 6);
+            return list;
+        }
+
+        private int MeasureCharacterColumnWidth(int characterCount)
+        {
+            string text = new string('0', Math.Max(1, characterCount));
+            return TextRenderer.MeasureText(text, _listFont, new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.Left | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + 8;
+        }
+
+        private void OnDrawHeader(object? s, VirtualDisasmList.VirtualHeaderPaintEventArgs e)
+        {
+            using var bg = new SolidBrush(_headerBack);
+            e.Graphics.FillRectangle(bg, e.Bounds);
+            Rectangle textRect = Rectangle.Inflate(e.Bounds, -2, 0);
+            TextRenderer.DrawText(e.Graphics, e.Header.Text, _listFont, textRect, _headerFore,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+            using var pen = new Pen(_headerBorder);
+            e.Graphics.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+            e.Graphics.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+        }
+
+        private void OnDrawCell(object? s, VirtualDisasmList.VirtualCellPaintEventArgs e)
+        {
+            if (e.ItemIndex < 0 || e.ItemIndex >= _rows.Count)
+                return;
+
+            ObjectViewRow row = _rows[e.ItemIndex];
+            string text = e.ColumnIndex switch
+            {
+                0 => $"{row.Address:X8}",
+                1 => row.Offset.ToString("X"),
+                _ => row.Label,
+            };
+            DrawListCell(e, text);
+        }
+
+        private void DrawListCell(VirtualDisasmList.VirtualCellPaintEventArgs e, string text)
+        {
+            Color back = e.Selected ? _selBack : _windowBack;
+            Color fore = e.Selected ? _selFore : _windowFore;
+            using var br = new SolidBrush(back);
+            e.Graphics.FillRectangle(br, e.Bounds);
+            Rectangle rect = Rectangle.Inflate(e.Bounds, -2, 0);
+            TextRenderer.DrawText(e.Graphics, text, _listFont, rect, fore,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+        }
+
+        private void OnListMouseDoubleClick(object? s, MouseEventArgs e)
+        {
+            if (_list == null)
+                return;
+
+            var hit = _list.HitTest(e.Location);
+            if (hit.Item == null)
+                return;
+
+            NavigateToRow(hit.Item.Index);
+        }
+
+        private void OnListKeyDown(object? s, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                if (_list != null)
+                    NavigateToRow(_list.SelectedIndices.Count > 0 ? _list.SelectedIndices[0] : -1);
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Escape)
+            {
+                Close();
+                e.Handled = true;
+            }
+        }
+
+        private void NavigateToRow(int index)
+        {
+            if (index < 0 || index >= _rows.Count)
+                return;
+
+            if (_list != null)
+            {
+                _list.SelectedIndices.Clear();
+                _list.SelectedIndices.Add(index);
+                _list.EnsureVisible(index);
+            }
+
+            NavigateToAddressCallback?.Invoke(_rows[index].Address);
+        }
+
+        private void UpdateColumnWidths()
+        {
+            if (_list == null || _list.Columns.Count < 3)
+                return;
+
+            _list.Columns[0].Width = MeasureCharacterColumnWidth(9);
+            _list.Columns[1].Width = MeasureCharacterColumnWidth(9);
+            int scrollbarWidth = _list.HasVerticalScrollbar ? SystemInformation.VerticalScrollBarWidth : 0;
+            _list.Columns[2].Width = Math.Max(80,
+                _list.ClientSize.Width - _list.Columns[0].Width - _list.Columns[1].Width - scrollbarWidth - 1);
+            _list.Invalidate();
+        }
+
+        public void ApplyThemeColors(Color formBack, Color formFore, Color windowBack, Color windowFore, bool dark)
+        {
+            _formBack = formBack;
+            _formFore = formFore;
+            _windowBack = windowBack;
+            _windowFore = windowFore;
+            _selBack = dark ? Color.FromArgb(64, 72, 84) : Color.FromArgb(0, 0, 128);
+            _selFore = Color.White;
+            _headerBack = dark ? Color.FromArgb(44, 48, 54) : SystemColors.Control;
+            _headerFore = dark ? Color.FromArgb(232, 232, 232) : SystemColors.ControlText;
+            _headerBorder = dark ? Color.FromArgb(82, 86, 94) : SystemColors.ControlDark;
+
+            BackColor = _formBack;
+            ForeColor = _formFore;
+
+            if (_list != null)
+            {
+                _list.BackColor = _windowBack;
+                _list.ForeColor = _windowFore;
+                _list.HeaderBackColor = _headerBack;
+                _list.HeaderBorderColor = _headerBorder;
+                _list.Invalidate();
+            }
+
+            if (_invalidLabel != null)
+            {
+                _invalidLabel.BackColor = _formBack;
+                _invalidLabel.ForeColor = _formFore;
+            }
+
+            UpdateColumnWidths();
         }
     }
 
@@ -1208,6 +1491,8 @@ namespace PS2Disassembler
         public List<ObjectLabelDefinition> ObjectDefinitions => _objects.Select(x => x.Clone()).ToList();
         public Func<IReadOnlyList<ObjectLabelDefinition>, ObjectLabelUpdateResult>? UpdateObjectsCallback { get; set; }
         public Action<uint>? NavigateToAddressCallback { get; set; }
+        public Func<ObjectLabelDefinition, uint?>? GetObjectRuntimeAddressCallback { get; set; }
+        public Action<Form>? PrepareOwnedWindowCallback { get; set; }
         private bool _showObjectLabels;
 
         private List<(string Name, uint Address)> _allLabels;
@@ -1407,13 +1692,16 @@ namespace PS2Disassembler
                 ShowImageMargin = false,
                 ShowCheckMargin = false,
             };
+            var miView = new ToolStripMenuItem("View", null, (_, _) => ViewSelectedObject());
             var miEdit = new ToolStripMenuItem("Edit", null, (_, _) => EditSelectedObject());
             var miRemove = new ToolStripMenuItem("Remove", null, (_, _) => DeleteSelectedObject());
+            _objectMenu.Items.Add(miView);
             _objectMenu.Items.Add(miEdit);
             _objectMenu.Items.Add(miRemove);
             _objectMenu.Opening += (_, e) =>
             {
                 bool hasSelection = _objectList.SelectedIndices.Count > 0;
+                miView.Enabled = hasSelection;
                 miEdit.Enabled = hasSelection;
                 miRemove.Enabled = hasSelection;
                 if (!hasSelection)
@@ -1926,8 +2214,8 @@ namespace PS2Disassembler
 
             if (hit.ColumnIndex == 0)
                 AcceptObjectSelection(idx);
-            else if (hit.ColumnIndex == 1)
-                EditSelectedObject(idx);
+            else
+                ViewSelectedObject();
         }
 
         private void AcceptLabelSelection()
@@ -1965,6 +2253,26 @@ namespace PS2Disassembler
 
             DialogResult = DialogResult.OK;
             Close();
+        }
+
+        private void ViewSelectedObject()
+        {
+            if (_objectList.SelectedIndices.Count == 0)
+                return;
+
+            int idx = _objectList.SelectedIndices[0];
+            if (idx < 0 || idx >= _objects.Count)
+                return;
+
+            ObjectLabelDefinition definition = _objects[idx].Clone();
+            uint? objectAddress = GetObjectRuntimeAddressCallback?.Invoke(definition);
+            var view = new ObjectLabelViewDialog(definition, objectAddress)
+            {
+                NavigateToAddressCallback = NavigateToAddressCallback,
+            };
+            view.ApplyThemeColors(_formBack, _formFore, _windowBack, _windowFore, _dark);
+            PrepareOwnedWindowCallback?.Invoke(view);
+            view.Show(this);
         }
 
         private void AddObjectDefinition()

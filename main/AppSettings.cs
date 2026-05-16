@@ -7,7 +7,7 @@ namespace PS2Disassembler
     internal sealed class AppSettings
     {
         // Application version — increment by 0.0.001 whenever packaging the source into a zip
-        public const string AppVersion = "0.0.113";
+        public const string AppVersion = "0.0.135";
 
         // Defaults
         public const string DefaultFontFamily = "Liberation Mono";
@@ -20,6 +20,7 @@ namespace PS2Disassembler
         public const int DefaultPinePort = 28011;
         public const int DefaultMcpPort = 21512;
         public const bool DefaultShowMemoryView = true;
+        public const bool DefaultShowCodeDesigner = true;
         public const bool DefaultShowTabsInTitleBar = true;
         public static readonly int[] SupportedRefreshRates = { 1, 10, 20, 30, 60, 100 };
         public static readonly string[] SupportedRowSpacings = { "Compact", "Normal", "Large" };
@@ -35,6 +36,7 @@ namespace PS2Disassembler
         public int PinePort { get; set; } = DefaultPinePort;
         public int McpPort { get; set; } = DefaultMcpPort;
         public bool ShowMemoryView { get; set; } = DefaultShowMemoryView;
+        public bool ShowCodeDesigner { get; set; } = DefaultShowCodeDesigner;
         public bool ShowTabsInTitleBar { get; set; } = DefaultShowTabsInTitleBar;
 
         private static string ConfigPath =>
@@ -86,6 +88,7 @@ namespace PS2Disassembler
             PinePort = DefaultPinePort;
             McpPort = DefaultMcpPort;
             ShowMemoryView = DefaultShowMemoryView;
+            ShowCodeDesigner = DefaultShowCodeDesigner;
             ShowTabsInTitleBar = DefaultShowTabsInTitleBar;
         }
 
@@ -103,6 +106,7 @@ namespace PS2Disassembler
             sb.AppendLine($"  \"PinePort\": {NormalizePort(PinePort, DefaultPinePort)},");
             sb.AppendLine($"  \"McpPort\": {NormalizePort(McpPort, DefaultMcpPort)},");
             sb.AppendLine($"  \"ShowMemoryView\": {(ShowMemoryView ? "true" : "false")},");
+            sb.AppendLine($"  \"ShowCodeDesigner\": {(ShowCodeDesigner ? "true" : "false")},");
             sb.AppendLine($"  \"ShowTabsInTitleBar\": {(ShowTabsInTitleBar ? "true" : "false")}");
             sb.AppendLine("}");
             return sb.ToString();
@@ -149,6 +153,9 @@ namespace PS2Disassembler
 
             bool? showMemoryView = ExtractBoolValue(json, "ShowMemoryView");
             settings.ShowMemoryView = showMemoryView ?? DefaultShowMemoryView;
+
+            bool? showCodeDesigner = ExtractBoolValue(json, "ShowCodeDesigner");
+            settings.ShowCodeDesigner = showCodeDesigner ?? DefaultShowCodeDesigner;
 
             bool? showTabsInTitleBar = ExtractBoolValue(json, "ShowTabsInTitleBar");
             settings.ShowTabsInTitleBar = showTabsInTitleBar ?? DefaultShowTabsInTitleBar;

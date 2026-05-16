@@ -130,7 +130,10 @@ namespace PS2Disassembler
 
         private bool IsLiveAttached()
         {
-            return _fileData != null && (_pineAvailable || (_liveProcId != 0 && _eeHostAddr != 0));
+            // A PINE socket by itself is not enough to mean this disassembly is a
+            // live PCSX2 session. Code Manager and live-only UI should only enable
+            // after AttachToPcsx2 has found the process and EE RAM base.
+            return _fileData != null && _liveProcId != 0 && _eeHostAddr != 0;
         }
 
         private DisassemblyRow GetLiveDisplayRow(int rowIndex)
@@ -785,6 +788,17 @@ namespace PS2Disassembler
             if (r.Mnemonic is ".float" or ".half" or ".byte" or ".word")
                 return StripTempLabelsFromAnnotations(text);
 
+            // Live break-time annotation override: for visible rows in the
+            // disassembler, use the cached register snapshot when flow and
+            // register-dependency checks show that the break-time value is
+            // meaningful. Rows separated from the break by a branch/call/jump
+            // or by an intervening write fall back to static annotations.
+            if (IsBreakAnnotationRow(rowIdx))
+            {
+                if (TryBuildLiveBreakAnnotation(r, rowIdx, out string liveAnnotated))
+                    return StripTempLabelsFromAnnotations(liveAnnotated);
+            }
+
             uint w = r.Word;
             uint op = (w >> 26) & 0x3F;
 
@@ -819,6 +833,105 @@ namespace PS2Disassembler
             }
 
             return StripTempLabelsFromAnnotations(text);
+        }
+
+        /// <summary>
+        /// Builds the live break-time annotation for <paramref name="r"/> using
+        /// the register snapshot cached at the most recent break. Returns true
+        /// when a meaningful annotation could be produced; returns false when
+        /// the row's instruction has no live-meaningful annotation (e.g. branch
+        /// at the break row itself, store on the row below, etc.) and the
+        /// caller should fall back to the static annotation.
+        /// </summary>
+        private bool TryBuildLiveBreakAnnotation(DisassemblyRow r, int rowIdx, out string annotated)
+        {
+            annotated = string.Empty;
+
+            uint w = r.Word;
+            if (w == 0)
+                return false;
+
+            uint op = (w >> 26) & 0x3F;
+
+            // Build the base text up front so we can append the annotation.
+            string baseText = FormatInstructionText(r, rowIdx);
+
+            // Strip any baked-in static annotation that FormatInstructionText
+            // produced (e.g. branch deltas / labels) — we only want to replace
+            // the data/address annotation, not the branch-target hint.
+            // FormatInstructionText only adds a sentinel-prefixed annotation
+            // for branch/jump/call rows. For other kinds it returns the bare
+            // instruction text. Either way, leave it alone — we're appending.
+
+            // Load/Store: show the effective address using live registers when
+            // the break snapshot still represents that row's source register.
+            // For current/future rows, also show the current memory value. For
+            // prior rows, avoid showing a value if an intervening store could
+            // have changed memory after the instruction executed.
+            if (TryGetLoadStoreAccessSpec(op, out _, out uint sizeBytes))
+            {
+                if (!TryComputeBreakDataAddressForRow(w, rowIdx, out uint addr))
+                    return false;
+
+                string? label = GetRealLabelAt(addr);
+                if (!ShouldDereferenceAnnotationAddress(addr))
+                {
+                    annotated = AppendAddressAnnotation(baseText, addr, label);
+                    return true;
+                }
+
+                bool canShowMemoryValue = true;
+                if (TryGetActiveBreakpointRowIndex(out int activeIdx) && rowIdx < activeIdx)
+                    canShowMemoryValue = !HasBreakMemoryWriteBetween(rowIdx + 1, activeIdx);
+
+                if (canShowMemoryValue && TryReadValueAt(addr, sizeBytes, out string valueText))
+                {
+                    annotated = !string.IsNullOrWhiteSpace(label)
+                        ? $"{baseText}{AnnotationSentinel} ({addr:X8} {valueText}) {label}"
+                        : $"{baseText}{AnnotationSentinel} ({addr:X8} {valueText})";
+                    return true;
+                }
+
+                annotated = AppendAddressAnnotation(baseText, addr, label);
+                return true;
+            }
+
+            // LUI: upper half — already deterministic, but render it the live
+            // way so the annotation style is consistent across the window.
+            if (op == 0x0F)
+            {
+                uint ui = w & 0xFFFF;
+                annotated = $"{baseText} ({ui << 16:X8})";
+                return true;
+            }
+
+            // Address builders that have not executed yet can be computed from
+            // the break snapshot when their source register is still valid.
+            // For past rows, use the destination-register check below instead;
+            // computing from the current source could double-apply the row.
+            if (op is 0x08 or 0x09 or 0x0D &&
+                TryGetActiveBreakpointRowIndex(out int builderActiveIdx) &&
+                rowIdx >= builderActiveIdx)
+            {
+                if (TryComputeBreakDataAddressForRow(w, rowIdx, out uint computedValue))
+                {
+                    annotated = AppendAddressAnnotation(baseText, computedValue, label: null);
+                    return true;
+                }
+            }
+
+            // For past ALU/address-builder instructions, show the destination's
+            // current break-time value only when straight-line flow and later
+            // writes prove that value still belongs to this row. This avoids
+            // misleading annotations across calls and delay slots, e.g.
+            // `jal; daddu a0, v0, zero; break-at-return-address`.
+            if (TryGetBreakDestinationValueForRow(rowIdx, w, out _, out uint destValue))
+            {
+                annotated = AppendAddressAnnotation(baseText, destValue, label: null);
+                return true;
+            }
+
+            return false;
         }
 
         private string FormatInstructionText(DisassemblyRow r, int rowIdx)
@@ -1424,9 +1537,9 @@ namespace PS2Disassembler
                     ? (isBranchJump ? Color.FromArgb(128, 128, 128) : Color.FromArgb(85, 85, 85))
                     : Color.FromArgb(0x00, 0x00, 0xb0));
 
-                // Word/halfword datatypes: dim the decimal value in parentheses while preserving
+                // Word/halfword/byte datatypes: dim the decimal value in parentheses while preserving
                 // any trailing annotation label exactly as-is, even when it contains spaces/numbers.
-                if ((displayDataKind == DataKind.Word || displayDataKind == DataKind.Half) && !forceWhite)
+                if ((displayDataKind == DataKind.Word || displayDataKind == DataKind.Half || displayDataKind == DataKind.Byte) && !forceWhite)
                 {
                     int parenPos = mainText.IndexOf('(');
                     if (parenPos > 0)
@@ -1705,7 +1818,25 @@ namespace PS2Disassembler
             }
             else
             {
-                addr = NormalizeFollowAddress(ComputeDataAddress(r, _selRow));
+                // Prefer a live break-time address/value when this visible row
+                // passed the same flow/dependency checks used by annotations.
+                if (IsBreakAnnotationRow(_selRow))
+                {
+                    uint w = r.Word;
+                    uint op = (w >> 26) & 0x3F;
+                    if (TryGetLoadStoreAccessSpec(op, out _, out _) ||
+                        op is 0x08 or 0x09 or 0x0D or 0x0F)
+                    {
+                        if (TryComputeBreakDataAddressForRow(w, _selRow, out uint liveAddress))
+                            addr = NormalizeFollowAddress(liveAddress);
+                    }
+
+                    if (addr == 0 && TryGetBreakDestinationValueForRow(_selRow, w, out _, out uint destValue))
+                        addr = NormalizeFollowAddress(destValue);
+                }
+
+                if (addr == 0)
+                    addr = NormalizeFollowAddress(ComputeDataAddress(r, _selRow));
                 if (addr == 0 && r.Target != 0)
                     addr = NormalizeFollowAddress(r.Target);
             }
@@ -2074,6 +2205,16 @@ namespace PS2Disassembler
                 { SetXrefTarget(); e.Handled = e.SuppressKeyPress = true; return; }
             if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.F3)
                 { GotoNextXref(); e.Handled = e.SuppressKeyPress = true; return; }
+            if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.F5)
+            {
+                var focused = FindFocusedLeafControl(this);
+                if (_mainTabs.SelectedIndex == 0 && focused is not RichTextBox and not TextBox and not ComboBox)
+                {
+                    TriggerFindNextFromHotkey();
+                    e.Handled = e.SuppressKeyPress = true;
+                    return;
+                }
+            }
             if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.O)
             {
                 var focused = FindFocusedLeafControl(this);
@@ -2490,6 +2631,12 @@ namespace PS2Disassembler
 
             byte[] data = _fileData;
             uint baseAddr = _baseAddr;
+            bool refreshFullLiveRam = !quiet && IsLiveAttached();
+            bool refreshTemporaryLabels = !quiet;
+            uint liveProcId = _liveProcId;
+            long liveEeHostAddr = _eeHostAddr;
+            bool usedLiveFullSnapshot = false;
+            string? liveRefreshWarning = null;
 
             Task.Run(() =>
             {
@@ -2498,6 +2645,68 @@ namespace PS2Disassembler
 
                 try
                 {
+                    if (refreshFullLiveRam)
+                    {
+                        BeginInvoke((Action)(() =>
+                        {
+                            if (token.IsCancellationRequested)
+                                return;
+                            _sbProgress.Text = "Refreshing full EE RAM for Analyzer…";
+                            _progressBar.Value = 0;
+                            _progressBar.Visible = true;
+                            SetActivityStatus("Refreshing EE RAM for Analyzer...", 0);
+                        }));
+
+                        IntPtr hProc = NativeMethods.OpenProcess(
+                            NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO,
+                            false, liveProcId);
+
+                        if (hProc == IntPtr.Zero)
+                            throw new InvalidOperationException("Analyzer could not open the live PCSX2 process to refresh the full 32 MB EE RAM snapshot.");
+
+                        try
+                        {
+                            int lastPct = -1;
+                            byte[]? liveRam = ReadEeRamFromAddress(hProc, liveEeHostAddr, out liveRefreshWarning, pct =>
+                            {
+                                if (token.IsCancellationRequested)
+                                    throw new OperationCanceledException(token);
+
+                                if (pct == 100 || lastPct < 0 || pct - lastPct >= 5)
+                                {
+                                    lastPct = pct;
+                                    BeginInvoke((Action)(() =>
+                                    {
+                                        if (token.IsCancellationRequested)
+                                            return;
+                                        int safePct = Math.Max(0, Math.Min(100, pct));
+                                        _progressBar.Value = safePct;
+                                        SetActivityStatus("Refreshing EE RAM for Analyzer...", safePct);
+                                    }));
+                                }
+                            });
+
+                            if (liveRam == null || liveRam.Length == 0)
+                                throw new InvalidOperationException($"Analyzer could not refresh the full 32 MB EE RAM snapshot: {liveRefreshWarning ?? "read failed"}");
+
+                            data = liveRam;
+                            usedLiveFullSnapshot = true;
+
+                            BeginInvoke((Action)(() =>
+                            {
+                                if (token.IsCancellationRequested)
+                                    return;
+                                _sbProgress.Text = "Analyzing refreshed EE RAM…";
+                                _progressBar.Value = 0;
+                                SetActivityStatus("Analyzing...", 0);
+                            }));
+                        }
+                        finally
+                        {
+                            NativeMethods.CloseHandle(hProc);
+                        }
+                    }
+
                     int total = Math.Max(1, data.Length / 4);
                     int report = Math.Max(total / 100, 1);
                     uint dataEnd = baseAddr + (uint)data.Length;
@@ -2676,6 +2885,34 @@ namespace PS2Disassembler
                     _xrefs = compactXrefs ?? new Dictionary<uint, uint[]>();
                     compactXrefs = null;
 
+                    if (usedLiveFullSnapshot)
+                    {
+                        _fileData = data;
+                        _hexList.VirtualListSize = Math.Max(1, ((_fileData?.Length ?? 0) + 15) / 16);
+                        _hexList.Invalidate();
+                        _asciiBytesBar?.Invalidate();
+                        LogPine($"Analyzer refreshed full live EE RAM snapshot before scanning ({data.Length:N0} bytes)."
+                            + (string.IsNullOrWhiteSpace(liveRefreshWarning) ? string.Empty : $" Warning: {liveRefreshWarning}"));
+                    }
+
+                    bool rebuildTemporaryDisassembly = refreshTemporaryLabels && error == null;
+                    if (rebuildTemporaryDisassembly)
+                    {
+                        if (_selRow >= 0 && _selRow < _rows.Count)
+                        {
+                            _pendingNavAddr = _rows[_selRow].Address;
+                            _pendingNavVisibleOffset = GetSelectedVisibleRowOffset();
+                            _pendingNavCenter = false;
+                        }
+
+                        // Manual analyzer runs must not keep stale generated labels from the
+                        // previous RAM contents.  Replace string temp-labels from the exact
+                        // snapshot the analyzer scanned, clear generated FUNC_ labels, and
+                        // rebuild the row model so old string/data ranges cannot survive near
+                        // addresses whose bytes have changed.
+                        ReplaceTemporaryAnalyzerLabelsFromData(data, baseAddr);
+                    }
+
                     if (_rows.Count > 0 && _disasmList.TopIndex >= 0)
                     {
                         int visStart = _disasmList.TopIndex;
@@ -2696,11 +2933,15 @@ namespace PS2Disassembler
                     }
                     else
                     {
-                        _sbProgress.Text = $"Analyzer: {_xrefs.Count:N0} targets mapped.";
+                        _sbProgress.Text = usedLiveFullSnapshot
+                            ? $"Analyzer: full EE RAM refreshed, {_xrefs.Count:N0} targets mapped."
+                            : $"Analyzer: {_xrefs.Count:N0} targets mapped.";
                         SetReadyStatus();
                     }
 
                     FinalizeAnalysisCleanup(extendedCleanup);
+                    if (rebuildTemporaryDisassembly)
+                        StartDisassembly();
                     StartQueuedXrefAnalyzerIfReady();
                 }));
             }, token);
@@ -2883,24 +3124,44 @@ namespace PS2Disassembler
 
         private void ShowFind()
         {
-            if (_findDialog != null && !_findDialog.IsDisposed)
+            if (_findDialog == null || _findDialog.IsDisposed)
             {
-                _findDialog.BringToFront();
-                _findDialog.FocusSearchBox();
-                return;
+                _findDialog = new FindDialog();
+                _findDialog.FindNext += OnFindNext;
+                _findDialog.FormClosing += (_, e) =>
+                {
+                    if (e.CloseReason == CloseReason.UserClosing)
+                    {
+                        e.Cancel = true;
+                        _findDialog.Hide();
+                    }
+                };
+                _findDialog.FormClosed += (_, _) => _findDialog = null;
+                ApplyThemeToControlTree(_findDialog);
+                ApplyThemeToWindowChrome(_findDialog, forceFrameRefresh: true);
             }
 
-            _findDialog = new FindDialog();
-            _findDialog.FindNext += OnFindNext;
-            _findDialog.FormClosed += (_, _) => _findDialog = null;
-            ApplyThemeToControlTree(_findDialog);
-            // Center on parent (CenterParent is unreliable for non-modal Show)
-            _findDialog.StartPosition = FormStartPosition.Manual;
-            _findDialog.Location = new Point(
-                Left + (Width - _findDialog.Width) / 2,
-                Top + (Height - _findDialog.Height) / 2);
-            _findDialog.Show(this);
+            if (!_findDialog.Visible)
+            {
+                // Center on parent (CenterParent is unreliable for non-modal Show)
+                _findDialog.StartPosition = FormStartPosition.Manual;
+                _findDialog.Location = new Point(
+                    Left + (Width - _findDialog.Width) / 2,
+                    Top + (Height - _findDialog.Height) / 2);
+                _findDialog.Show(this);
+            }
+
+            _findDialog.BringToFront();
+            _findDialog.FocusSearchBox();
             ApplyThemeToWindowChrome(_findDialog, forceFrameRefresh: true);
+        }
+
+        private void TriggerFindNextFromHotkey()
+        {
+            if (_findDialog == null || _findDialog.IsDisposed || string.IsNullOrEmpty(_findDialog.SearchText))
+                return;
+
+            OnFindNext(_findDialog, EventArgs.Empty);
         }
 
         private async void OnFindNext(object? sender, EventArgs e)
@@ -3056,20 +3317,17 @@ namespace PS2Disassembler
             if (!IsLiveAttached())
                 return (_fileData, baseAddress, null);
 
-            var validNames = new[] { "pcsx2", "pcsx2-qt" };
-            var proc = Process.GetProcesses()
-                .FirstOrDefault(p => validNames.Any(name => string.Equals(p.ProcessName, name, StringComparison.OrdinalIgnoreCase)));
-            if (proc == null)
+            if (_liveProcId == 0 || _eeHostAddr == 0)
                 return (_fileData, baseAddress, null);
 
             uint access = NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_QUERY_INFO;
-            IntPtr hProc = NativeMethods.OpenProcess(access, false, (uint)proc.Id);
+            IntPtr hProc = NativeMethods.OpenProcess(access, false, _liveProcId);
             if (hProc == IntPtr.Zero)
                 return (_fileData, baseAddress, null);
 
             try
             {
-                var ram = ReadEeRamViaSymbol(hProc, out string? err);
+                var ram = ReadEeRamFromAddress(hProc, _eeHostAddr, out string? err, null);
                 if (ram != null && ram.Length > 0)
                     return (ram, 0u, null);
                 return (_fileData, baseAddress, err);
@@ -3128,77 +3386,76 @@ namespace PS2Disassembler
         private static List<byte[]> ParseHexPatternCandidates(string hex)
         {
             var patterns = new List<byte[]>();
-            if (string.IsNullOrWhiteSpace(hex))
-                return patterns;
+            byte[]? displayedPattern = ParseDisplayedHexPattern(hex);
+            if (displayedPattern != null && displayedPattern.Length > 0)
+                AddUniqueHexPattern(patterns, displayedPattern);
 
-            static void AddCandidate(List<byte[]> target, byte[]? candidate)
-            {
-                if (candidate == null || candidate.Length == 0)
-                    return;
-                if (target.Any(existing => existing.AsSpan().SequenceEqual(candidate)))
-                    return;
-                target.Add(candidate);
-            }
+            byte[]? rawPattern = ParseRawHexPattern(hex);
+            if (rawPattern != null && rawPattern.Length > 0)
+                AddUniqueHexPattern(patterns, rawPattern);
 
-            static string NormalizeHexToken(string token)
-            {
-                token = token.Trim();
-                if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                    token = token[2..];
-                return token;
-            }
-
-            string[] tokenized = hex
-                .Replace("-", " ")
-                .Replace(",", " ")
-                .Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            string[] tokens = tokenized.Select(NormalizeHexToken).Where(t => t.Length > 0).ToArray();
-            string rawJoined = string.Concat(tokens);
-
-            bool explicitWordTokens = tokens.Length > 0 && tokens.All(t => t.Length == 8);
-            bool implicitWordPattern = tokens.Length == 1 && rawJoined.Length >= 8 && rawJoined.Length % 8 == 0;
-            if (explicitWordTokens || implicitWordPattern)
-            {
-                string[] wordTokens = explicitWordTokens
-                    ? tokens
-                    : Enumerable.Range(0, rawJoined.Length / 8).Select(i => rawJoined.Substring(i * 8, 8)).ToArray();
-                AddCandidate(patterns, ParseDisplayedWordPattern(wordTokens));
-            }
-
-            AddCandidate(patterns, ParseRawHexPattern(rawJoined));
             return patterns;
+        }
+
+        private static void AddUniqueHexPattern(List<byte[]> patterns, byte[] candidate)
+        {
+            foreach (byte[] existing in patterns)
+            {
+                if (existing.Length == candidate.Length && existing.SequenceEqual(candidate))
+                    return;
+            }
+            patterns.Add(candidate);
+        }
+
+        private static byte[]? ParseDisplayedHexPattern(string hex)
+        {
+            byte[]? bytes = ParseRawHexPattern(hex);
+            if (bytes == null || bytes.Length == 0)
+                return bytes;
+
+            byte[] converted = new byte[bytes.Length];
+            int offset = 0;
+            while (offset < bytes.Length)
+            {
+                int groupLength = Math.Min(4, bytes.Length - offset);
+                for (int i = 0; i < groupLength; i++)
+                    converted[offset + i] = bytes[offset + groupLength - 1 - i];
+                offset += groupLength;
+            }
+            return converted;
         }
 
         private static byte[]? ParseRawHexPattern(string hex)
         {
-            if (string.IsNullOrEmpty(hex) || hex.Length % 2 != 0)
+            if (string.IsNullOrWhiteSpace(hex))
                 return null;
 
-            try
+            var sb = new StringBuilder(hex.Length);
+            for (int i = 0; i < hex.Length; i++)
             {
-                byte[] result = new byte[hex.Length / 2];
-                for (int i = 0; i < result.Length; i++)
-                    result[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
-                return result;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static byte[]? ParseDisplayedWordPattern(IEnumerable<string> wordTokens)
-        {
-            try
-            {
-                var bytes = new List<byte>();
-                foreach (string token in wordTokens)
+                char ch = hex[i];
+                if (char.IsWhiteSpace(ch) || ch == '-' || ch == ',' || ch == '_')
+                    continue;
+                if (ch == '0' && i + 1 < hex.Length && (hex[i + 1] == 'x' || hex[i + 1] == 'X'))
                 {
-                    if (!uint.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out uint word))
-                        return null;
-                    bytes.AddRange(BitConverter.GetBytes(word));
+                    i++;
+                    continue;
                 }
-                return bytes.Count > 0 ? bytes.ToArray() : null;
+                if (!Uri.IsHexDigit(ch))
+                    return null;
+                sb.Append(ch);
+            }
+
+            if (sb.Length == 0 || (sb.Length & 1) != 0)
+                return null;
+
+            try
+            {
+                string compactHex = sb.ToString();
+                byte[] result = new byte[compactHex.Length / 2];
+                for (int i = 0; i < result.Length; i++)
+                    result[i] = Convert.ToByte(compactHex.Substring(i * 2, 2), 16);
+                return result;
             }
             catch
             {

@@ -227,10 +227,45 @@ namespace PS2Disassembler
             lv.Columns[1].Width = Math.Max(80, lv.ClientSize.Width - lv.Columns[0].Width - (lv.HasVerticalScrollbar ? 14 : 0));
         }
 
-        private void SetBreakpointSidebarVisible(bool visible)
+        private bool IsBreakpointSidebarActuallyVisible()
+        {
+            return _disasmBreakpointSplit != null &&
+                   !_disasmBreakpointSplit.Panel2Collapsed &&
+                   _breakpointsPanel != null &&
+                   _breakpointsPanel.Visible &&
+                   ReferenceEquals(_breakpointsPanel.Parent, _disasmBreakpointSplit.Panel2) &&
+                   _disasmBreakpointSplit.Panel2.ClientSize.Width > 0;
+        }
+
+        private void SyncBreakpointSidebarMenuCheckState(bool visible)
+        {
+            if (_miBreakpointsSidebar != null && _miBreakpointsSidebar.Checked != visible)
+                _miBreakpointsSidebar.Checked = visible;
+        }
+
+        private void ToggleBreakpointSidebarFromMenu()
+        {
+            SetBreakpointSidebarVisible(!IsBreakpointSidebarActuallyVisible(), refreshDebugger: true);
+        }
+
+        private void EnsureBreakpointSidebarVisible(bool refreshDebugger = false)
+        {
+            if (IsBreakpointSidebarActuallyVisible())
+            {
+                SyncBreakpointSidebarMenuCheckState(true);
+                return;
+            }
+
+            SetBreakpointSidebarVisible(true, refreshDebugger);
+        }
+
+        private void SetBreakpointSidebarVisible(bool visible, bool refreshDebugger = true)
         {
             if (_disasmBreakpointSplit == null)
+            {
+                SyncBreakpointSidebarMenuCheckState(false);
                 return;
+            }
 
             if (visible)
             {
@@ -270,11 +305,14 @@ namespace PS2Disassembler
                     _disasmBreakpointSplit.Invalidate(true);
                     _disasmBreakpointSplit.Update();
                 }
-                RefreshDebuggerUiTick(force: true);
+                SyncBreakpointSidebarMenuCheckState(IsBreakpointSidebarActuallyVisible());
+                if (refreshDebugger)
+                    RefreshDebuggerUiTick(force: true);
                 return;
             }
 
             _disasmBreakpointSplit.Panel2Collapsed = true;
+            SyncBreakpointSidebarMenuCheckState(false);
         }
 
         private void ApplyBreakpointSidebarSplitConstraints()
@@ -452,27 +490,35 @@ namespace PS2Disassembler
             {
                 var status = _debugServer.GetStatus();
 
-                // Avoid polling list_memchecks while the VM is running.
-                // On some PCSX2 builds, the running+memcheck polling path appears to be unstable and
-                // can delay or crash read/write watchpoints. Native memcheck breaking is fast enough for
-                // us to identify a watchpoint hit from the paused state alone.
-                IReadOnlyList<DebugBreakpointInfo> breakpointInfos;
-                try
+                // Avoid polling breakpoint/memcheck lists while the VM is running.
+                // Some PCSX2/debug-server builds momentarily pause/resume the VM while
+                // enumerating debugger breakpoints. Keep the local breakpoint model as
+                // authoritative while running; only sync from the server when already
+                // paused or when a caller explicitly forces a refresh.
+                IReadOnlyList<DebugBreakpointInfo> breakpointInfos = Array.Empty<DebugBreakpointInfo>();
+                bool breakpointListSynced = false;
+                if (status.Paused || force)
                 {
-                    breakpointInfos = _userBreakpoints.Count > 0 || force
-                        ? _debugServer.ListBreakpoints()
-                        : Array.Empty<DebugBreakpointInfo>();
-                }
-                catch
-                {
-                    breakpointInfos = Array.Empty<DebugBreakpointInfo>();
+                    try
+                    {
+                        if (_userBreakpoints.Count > 0 || force)
+                        {
+                            breakpointInfos = _debugServer.ListBreakpoints();
+                            breakpointListSynced = true;
+                        }
+                    }
+                    catch
+                    {
+                        breakpointInfos = Array.Empty<DebugBreakpointInfo>();
+                    }
                 }
 
                 bool wasPaused = _lastDebuggerPaused;
                 uint previousPc = _lastDebuggerPc;
                 uint? previousActive = _activeBreakpointAddress;
 
-                SyncUserBreakpointsFromServer(breakpointInfos);
+                if (breakpointListSynced)
+                    SyncUserBreakpointsFromServer(breakpointInfos);
 
                 bool readWatchEnabled = !_watchpointsSuspended && _chkReadBreakpoint?.Checked == true && _readMemcheckAddress.HasValue;
                 bool writeWatchEnabled = !_watchpointsSuspended && _chkWriteBreakpoint?.Checked == true && _writeMemcheckAddress.HasValue;
@@ -599,8 +645,8 @@ namespace PS2Disassembler
                 bool stateChanged = effectivePaused != wasPaused || status.Pc != previousPc || activeAddress != previousActive;
                 if (effectivePaused && stateChanged)
                 {
-                    if (activeAddress.HasValue && _miBreakpointsSidebar != null && !_miBreakpointsSidebar.Checked)
-                        _miBreakpointsSidebar.Checked = true;
+                    if (activeAddress.HasValue)
+                        EnsureBreakpointSidebarVisible(refreshDebugger: false);
                     RefreshPausedDebuggerDetails();
                     FocusDebuggerAddress(activeAddress ?? _pausedBreakpointUiAddress ?? status.Pc);
                 }
@@ -644,35 +690,96 @@ namespace PS2Disassembler
 
         private static uint GetWatchpointEndAddress(uint address)
         {
-            return address + WatchpointSizeBytes;
+            return TryBuildWatchpointRange(address, out _, out uint endExclusive)
+                ? endExclusive
+                : NormalizeMipsAddress(address);
         }
 
-        private bool PauseVmForBreakpointMutation(out bool resumeAfter)
+        private static bool IsPs2DisDebugArtifact(string? description)
         {
-            resumeAfter = false;
+            return !string.IsNullOrWhiteSpace(description) &&
+                   description.TrimStart().StartsWith("ps2dis#", StringComparison.OrdinalIgnoreCase);
+        }
 
-            var status = _debugServer.GetStatus();
-            if (status.Paused)
-                return true;
+        private static bool TryBuildEeRamRange(uint address, uint byteCount, out uint normalizedAddress, out uint endExclusive)
+        {
+            normalizedAddress = NormalizeMipsAddress(address);
+            endExclusive = normalizedAddress;
 
-            _debugServer.Pause();
-            for (int i = 0; i < 25; i++)
+            if (byteCount == 0 || normalizedAddress >= EeRamSizeBytes)
+                return false;
+
+            ulong end = (ulong)normalizedAddress + byteCount;
+            if (end > EeRamSizeBytes)
+                return false;
+
+            endExclusive = (uint)end;
+            return endExclusive > normalizedAddress;
+        }
+
+        private static bool TryNormalizeInstructionBreakpoint(uint address, out uint normalizedAddress)
+        {
+            normalizedAddress = NormalizeMipsAddress(address);
+            return (normalizedAddress & 3u) == 0 && TryBuildEeRamRange(normalizedAddress, 4u, out normalizedAddress, out _);
+        }
+
+        private static bool TryBuildWatchpointRange(uint address, out uint normalizedAddress, out uint endExclusive)
+            => TryBuildEeRamRange(address, WatchpointSizeBytes, out normalizedAddress, out endExclusive);
+
+        private bool TryBuildAccessMonitorRange(uint address, out uint normalizedAddress, out uint endExclusive)
+            => TryBuildEeRamRange(address, Math.Max(1u, _accessMonitorSizeBytes), out normalizedAddress, out endExclusive);
+
+        private bool TryPauseDebugServerForMutation(string operationName, out bool resumeAfterMutation, out string? errorMessage)
+        {
+            resumeAfterMutation = false;
+            errorMessage = null;
+
+            try
             {
-                Thread.Sleep(10);
-                var pausedStatus = _debugServer.GetStatus();
-                if (pausedStatus.Paused)
-                {
-                    resumeAfter = true;
+                var status = _debugServer.GetStatus();
+                if (status.Paused)
                     return true;
-                }
-            }
 
-            throw new IOException("Timed out pausing PCSX2 while updating breakpoints.");
+                resumeAfterMutation = true;
+                _debugServer.Pause();
+
+                for (int i = 0; i < 50; i++)
+                {
+                    Thread.Sleep(10);
+                    try
+                    {
+                        if (_debugServer.GetStatus().Paused)
+                            return true;
+                    }
+                    catch
+                    {
+                        // Keep waiting briefly; transient status reads can fail while PCSX2 is pausing.
+                    }
+                }
+
+                errorMessage = $"Timed out pausing PCSX2 before {operationName}. The breakpoint was not changed to avoid an emulator crash.";
+                if (resumeAfterMutation)
+                {
+                    try { _debugServer.Resume(); } catch { }
+                    resumeAfterMutation = false;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                errorMessage = $"Could not pause PCSX2 before {operationName}: {ex.Message}";
+                if (resumeAfterMutation)
+                {
+                    try { _debugServer.Resume(); } catch { }
+                    resumeAfterMutation = false;
+                }
+                return false;
+            }
         }
 
-        private void RestoreVmAfterBreakpointMutation(bool resumeAfter)
+        private void ResumeDebugServerAfterMutation(bool resumeAfterMutation)
         {
-            if (!resumeAfter)
+            if (!resumeAfterMutation)
                 return;
 
             try { _debugServer.Resume(); } catch { }
@@ -680,31 +787,107 @@ namespace PS2Disassembler
 
         private void SyncDesiredBreakpointsToServer()
         {
-            _debugServer.ClearBreakpoints();
-            _accessMonitorMemcheckInstalled = false;
-
-            foreach (uint bp in _userBreakpoints.OrderBy(a => a))
+            // Do not use the debug server's global clear_breakpoints command here.
+            // Some PCSX2/debug-server builds implement that command by pausing and
+            // resuming the VM. Reconcile ps2dis#-owned items with per-item commands,
+            // but do all listing/removal/addition while the EE is paused.
+            var desiredPcBreakpoints = new HashSet<uint>();
+            foreach (uint userBreakpoint in _userBreakpoints)
             {
-                _debugServer.SetBreakpoint(bp, description: $"ps2dis# {bp:X8}");
+                if (TryNormalizeInstructionBreakpoint(userBreakpoint, out uint normalizedBreakpoint))
+                    desiredPcBreakpoints.Add(normalizedBreakpoint);
             }
 
-            if (_chkReadBreakpoint?.Checked == true && _readMemcheckAddress.HasValue)
-            {
-                _debugServer.SetMemcheck(_readMemcheckAddress.Value, GetWatchpointEndAddress(_readMemcheckAddress.Value), "read",
-                    action: "break", description: "ps2dis# OnRead");
-            }
+            // Always reconcile memchecks when this helper is called. A checkbox may
+            // already have cleared its local address before calling us, but the old
+            // ps2dis# memcheck can still be installed in PCSX2 and must be removed.
+            if (!TryPauseDebugServerForMutation("reconciling breakpoints/watchpoints", out bool resumeAfterBatchMutation, out string? pauseError))
+                throw new IOException(pauseError ?? "Could not pause PCSX2 before changing breakpoints/watchpoints.");
 
-            if (_chkWriteBreakpoint?.Checked == true && _writeMemcheckAddress.HasValue)
+            try
             {
-                _debugServer.SetMemcheck(_writeMemcheckAddress.Value, GetWatchpointEndAddress(_writeMemcheckAddress.Value), "write",
-                    action: "break", description: "ps2dis# OnWrite");
-            }
+                IReadOnlyList<DebugBreakpointInfo> serverPcBreakpoints = Array.Empty<DebugBreakpointInfo>();
+                try
+                {
+                    serverPcBreakpoints = _debugServer.ListBreakpoints();
+                }
+                catch
+                {
+                    // Listing is best-effort. If it fails, still try to arm desired breakpoints below.
+                }
 
-            if (_accessMonitorActive)
+                var installedAppPcBreakpoints = new HashSet<uint>();
+                foreach (DebugBreakpointInfo bp in serverPcBreakpoints)
+                {
+                    if (bp.Temporary || bp.Stepping)
+                        continue;
+
+                    uint serverAddress = NormalizeMipsAddress(bp.Address);
+                    if (IsPs2DisDebugArtifact(bp.Description))
+                        installedAppPcBreakpoints.Add(serverAddress);
+                }
+
+                foreach (uint serverAddress in installedAppPcBreakpoints)
+                {
+                    if (!desiredPcBreakpoints.Contains(serverAddress))
+                    {
+                        try { _debugServer.RemoveBreakpoint(serverAddress); } catch { }
+                    }
+                }
+
+                foreach (uint bp in desiredPcBreakpoints.OrderBy(a => a))
+                {
+                    if (!installedAppPcBreakpoints.Contains(bp))
+                        _debugServer.SetBreakpoint(bp, description: $"ps2dis# {bp:X8}");
+                }
+
+                try
+                {
+                    foreach (DebugMemcheckInfo mc in _debugServer.ListMemchecks())
+                    {
+                        if (IsPs2DisDebugArtifact(mc.Description))
+                        {
+                            try { _debugServer.RemoveMemcheck(mc.Start, mc.End); } catch { }
+                        }
+                    }
+                }
+                catch
+                {
+                    // If listing memchecks fails, fall back to removing the addresses we know about.
+                    if (_readMemcheckAddress.HasValue)
+                        try { _debugServer.RemoveMemcheck(_readMemcheckAddress.Value, GetWatchpointEndAddress(_readMemcheckAddress.Value)); } catch { }
+                    if (_writeMemcheckAddress.HasValue)
+                        try { _debugServer.RemoveMemcheck(_writeMemcheckAddress.Value, GetWatchpointEndAddress(_writeMemcheckAddress.Value)); } catch { }
+                    if (_accessMonitorAddressValid)
+                        try { _debugServer.RemoveMemcheck(_accessMonitorAddress, GetAccessMonitorEndAddress(_accessMonitorAddress)); } catch { }
+                }
+
+                _accessMonitorMemcheckInstalled = false;
+
+                if (_chkReadBreakpoint?.Checked == true && _readMemcheckAddress.HasValue &&
+                    TryBuildWatchpointRange(_readMemcheckAddress.Value, out uint readStart, out uint readEnd))
+                {
+                    _debugServer.SetMemcheck(readStart, readEnd, "read",
+                        action: "break", description: "ps2dis# OnRead");
+                }
+
+                if (_chkWriteBreakpoint?.Checked == true && _writeMemcheckAddress.HasValue &&
+                    TryBuildWatchpointRange(_writeMemcheckAddress.Value, out uint writeStart, out uint writeEnd))
+                {
+                    _debugServer.SetMemcheck(writeStart, writeEnd, "write",
+                        action: "break", description: "ps2dis# OnWrite");
+                }
+
+                if (_accessMonitorActive && TryBuildAccessMonitorRange(_accessMonitorAddress, out uint accessStart, out uint accessEnd))
+                {
+                    _debugServer.SetMemcheck(accessStart, accessEnd, _accessMonitorType,
+                        action: "break", description: "ps2dis# AccessMonitor");
+                    _accessMonitorMemcheckInstalled = true;
+                }
+            }
+            finally
             {
-                _debugServer.SetMemcheck(_accessMonitorAddress, GetAccessMonitorEndAddress(_accessMonitorAddress), _accessMonitorType,
-                    action: "break", description: "ps2dis# AccessMonitor");
-                _accessMonitorMemcheckInstalled = true;
+                ResumeDebugServerAfterMutation(resumeAfterBatchMutation);
             }
 
             _watchpointsSuspended = false;
@@ -713,10 +896,48 @@ namespace PS2Disassembler
             _nextDebuggerPollUtc = DateTime.MinValue;
         }
 
+        private void RemoveAllDebugBreakpointsWithoutGlobalClear()
+        {
+            // Do not call list_breakpoints/list_memchecks here. On affected PCSX2
+            // builds those list helpers are a hidden pause/resume source. Clear only
+            // debugger artifacts that ps2dis# itself knows it installed, and pause
+            // once around all PC breakpoint and memcheck removals.
+            bool hasDebuggerArtifacts = _userBreakpoints.Count > 0 ||
+                                        _readMemcheckAddress.HasValue ||
+                                        _writeMemcheckAddress.HasValue ||
+                                        _accessMonitorAddressValid;
+            bool resumeAfterMutation = false;
+            if (hasDebuggerArtifacts &&
+                !TryPauseDebugServerForMutation("clearing breakpoints/watchpoints", out resumeAfterMutation, out string? pauseError))
+            {
+                throw new IOException(pauseError ?? "Could not pause PCSX2 before clearing breakpoints/watchpoints.");
+            }
+
+            try
+            {
+                foreach (uint bp in _userBreakpoints.ToArray())
+                {
+                    try { _debugServer.RemoveBreakpoint(NormalizeMipsAddress(bp)); } catch { }
+                }
+
+                if (_readMemcheckAddress.HasValue)
+                    try { _debugServer.RemoveMemcheck(_readMemcheckAddress.Value, GetWatchpointEndAddress(_readMemcheckAddress.Value)); } catch { }
+                if (_writeMemcheckAddress.HasValue)
+                    try { _debugServer.RemoveMemcheck(_writeMemcheckAddress.Value, GetWatchpointEndAddress(_writeMemcheckAddress.Value)); } catch { }
+                if (_accessMonitorAddressValid)
+                    try { _debugServer.RemoveMemcheck(_accessMonitorAddress, GetAccessMonitorEndAddress(_accessMonitorAddress)); } catch { }
+            }
+            finally
+            {
+                ResumeDebugServerAfterMutation(resumeAfterMutation);
+            }
+        }
+
         private uint GetAccessMonitorEndAddress(uint address)
         {
-            uint size = Math.Max(1u, _accessMonitorSizeBytes);
-            return address + size;
+            return TryBuildAccessMonitorRange(address, out _, out uint endExclusive)
+                ? endExclusive
+                : NormalizeMipsAddress(address);
         }
 
         private bool SuspendWatchpoints()
@@ -759,21 +980,21 @@ namespace PS2Disassembler
             if (!_watchpointsSuspended)
                 return;
 
-            if (_readMemcheckAddress.HasValue)
+            if (_readMemcheckAddress.HasValue && TryBuildWatchpointRange(_readMemcheckAddress.Value, out uint readStart, out uint readEnd))
             {
                 try
                 {
-                    _debugServer.SetMemcheck(_readMemcheckAddress.Value, GetWatchpointEndAddress(_readMemcheckAddress.Value), "read",
+                    _debugServer.SetMemcheck(readStart, readEnd, "read",
                         action: "break", description: "ps2dis# OnRead");
                 }
                 catch { }
             }
 
-            if (_writeMemcheckAddress.HasValue)
+            if (_writeMemcheckAddress.HasValue && TryBuildWatchpointRange(_writeMemcheckAddress.Value, out uint writeStart, out uint writeEnd))
             {
                 try
                 {
-                    _debugServer.SetMemcheck(_writeMemcheckAddress.Value, GetWatchpointEndAddress(_writeMemcheckAddress.Value), "write",
+                    _debugServer.SetMemcheck(writeStart, writeEnd, "write",
                         action: "break", description: "ps2dis# OnWrite");
                 }
                 catch { }
@@ -790,9 +1011,10 @@ namespace PS2Disassembler
             _userBreakpoints.Clear();
             foreach (DebugBreakpointInfo bp in breakpointInfos)
             {
-                if (!bp.Enabled || bp.Temporary || bp.Stepping)
+                if (!bp.Enabled || bp.Temporary || bp.Stepping || !IsPs2DisDebugArtifact(bp.Description))
                     continue;
-                _userBreakpoints.Add(NormalizeMipsAddress(bp.Address));
+                if (TryNormalizeInstructionBreakpoint(bp.Address, out uint normalizedAddress))
+                    _userBreakpoints.Add(normalizedAddress);
             }
         }
 
@@ -802,6 +1024,10 @@ namespace PS2Disassembler
             {
                 DebugRegisterSnapshot regs = _debugServer.ReadRegisters();
                 IReadOnlyList<DebugBacktraceFrame> frames = _debugServer.GetBacktrace();
+                // Cache the snapshot for the live break-time annotations on the
+                // rows around the active break PC. Cleared in
+                // ClearPausedBreakpointUiState / ContinueExecution / step.
+                _breakRegisterSnapshot = regs;
                 PopulateRegisters(regs);
                 PopulateCallStack(frames, regs);
             }
@@ -822,8 +1048,7 @@ namespace PS2Disassembler
             if (_mainTabs != null && _mainTabs.Pages.Count > 0)
                 _mainTabs.SelectedIndex = 0;
 
-            if (_miBreakpointsSidebar != null && !_miBreakpointsSidebar.Checked)
-                _miBreakpointsSidebar.Checked = true;
+            EnsureBreakpointSidebarVisible(refreshDebugger: false);
 
             if (TryGetRowIndexByAddress(address, out int idx))
             {
@@ -833,7 +1058,45 @@ namespace PS2Disassembler
                 return;
             }
 
-            NavigateToAddress(address, keepVisibleRow: false);
+            // Do not fall back to the nearest row for debugger breaks.  When PCSX2
+            // reports a PC outside the currently materialized disassembly window,
+            // selecting the nearest row makes it look like ps2dis# jumped without
+            // highlighting the actual break.  Build a small window around the PC so
+            // the pending navigation can resolve to the exact aligned instruction row.
+            if (TryStartDebuggerDisassemblyWindow(address))
+                return;
+
+            SetStatusText($"Breakpoint PC {address:X8} is outside the loaded EE RAM image.");
+        }
+
+        private bool TryStartDebuggerDisassemblyWindow(uint normalizedAddress)
+        {
+            if (_fileData == null || _fileData.Length == 0)
+                return false;
+
+            uint alignedAddress = normalizedAddress & ~3u;
+            if (!TryBuildEeRamRange(alignedAddress, 4u, out alignedAddress, out _))
+                return false;
+
+            uint normalizedBase = NormalizeMipsAddress(_baseAddr);
+            ulong normalizedEnd = (ulong)normalizedBase + (uint)_fileData.Length;
+            if (alignedAddress < normalizedBase || (ulong)alignedAddress + 4u > normalizedEnd)
+                return false;
+
+            uint fileOffset = alignedAddress - normalizedBase;
+            uint windowStartOffset = fileOffset & ~0xFFFFu;
+            uint remaining = (uint)Math.Max(0, _fileData.Length - (int)Math.Min(windowStartOffset, (uint)_fileData.Length));
+            if (remaining == 0)
+                return false;
+
+            const uint DebuggerWindowLength = 0x00040000u; // 256 KB around the break PC.
+            _disasmBase = _baseAddr + windowStartOffset;
+            _disasmLen = Math.Min(DebuggerWindowLength, remaining);
+            _pendingNavAddr = _baseAddr + fileOffset;
+            _pendingNavVisibleOffset = 0;
+            _pendingNavCenter = true;
+            StartDisassembly();
+            return true;
         }
 
 
@@ -854,9 +1117,9 @@ namespace PS2Disassembler
                 return;
 
             uint address = _rows[_selRow].Address;
-            if ((address & 3u) != 0)
+            if (!TryNormalizeInstructionBreakpoint(address, out address))
             {
-                MessageBox.Show("Instruction breakpoints require a 4-byte aligned disassembly row.", "Breakpoints", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("Instruction breakpoints require a 4-byte aligned EE RAM address.", "Breakpoints", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
@@ -869,23 +1132,24 @@ namespace PS2Disassembler
 
             try
             {
-                bool alreadyPresent = _userBreakpoints.Contains(address);
-                bool resumeAfterMutation = false;
+                if (_userBreakpoints.Contains(address))
+                    return;
+
+                // Mutating PCSX2 breakpoint tables while the EE recompiler is running
+                // can tear down JIT state out from under the VM. Always quiesce the
+                // EE before adding/removing debugger artifacts, and fail closed if the
+                // pause cannot be confirmed.
+                if (!TryPauseDebugServerForMutation("setting the PC breakpoint", out bool resumeAfterMutation, out string? pauseError))
+                    throw new IOException(pauseError ?? "Could not pause PCSX2 before setting the breakpoint.");
+
                 try
                 {
+                    _debugServer.SetBreakpoint(address, description: $"ps2dis# {address:X8}");
                     _userBreakpoints.Add(address);
-                    PauseVmForBreakpointMutation(out resumeAfterMutation);
-                    SyncDesiredBreakpointsToServer();
-                }
-                catch
-                {
-                    if (!alreadyPresent)
-                        _userBreakpoints.Remove(address);
-                    throw;
                 }
                 finally
                 {
-                    RestoreVmAfterBreakpointMutation(resumeAfterMutation);
+                    ResumeDebugServerAfterMutation(resumeAfterMutation);
                 }
 
                 _disasmList?.Invalidate();
@@ -937,8 +1201,7 @@ namespace PS2Disassembler
                         {
                             _activeBreakpointAddress = address;
                             ApplyPausedBreakpointMenuStatus(address);
-                            if (_miBreakpointsSidebar != null && !_miBreakpointsSidebar.Checked)
-                                _miBreakpointsSidebar.Checked = true;
+                            EnsureBreakpointSidebarVisible(refreshDebugger: false);
                         }
                     }
                 }
@@ -954,19 +1217,13 @@ namespace PS2Disassembler
         {
             try
             {
-                if (EnsureDebugServerConnected(forceRetry: true))
+                bool hasKnownServerBreakpoints = _userBreakpoints.Count > 0 ||
+                                                _readMemcheckAddress.HasValue ||
+                                                _writeMemcheckAddress.HasValue ||
+                                                _accessMonitorActive;
+                if (hasKnownServerBreakpoints && EnsureDebugServerConnected(forceRetry: true))
                 {
-                    bool resumeAfterMutation = false;
-                    try
-                    {
-                        PauseVmForBreakpointMutation(out resumeAfterMutation);
-                        SuspendWatchpoints();
-                        try { _debugServer.ClearBreakpoints(); } catch { }
-                    }
-                    finally
-                    {
-                        RestoreVmAfterBreakpointMutation(resumeAfterMutation);
-                    }
+                    RemoveAllDebugBreakpointsWithoutGlobalClear();
                 }
             }
             catch (Exception ex)
@@ -983,7 +1240,7 @@ namespace PS2Disassembler
             _readMemcheckHits = -1;
             _writeMemcheckHits = -1;
             _watchpointsSuspended = false;
-            StopAccessMonitor(quiet: true);
+            StopAccessMonitor(quiet: true, resumeIfPaused: false);
             if (_chkReadBreakpoint != null) _chkReadBreakpoint.Checked = false;
             if (_chkWriteBreakpoint != null) _chkWriteBreakpoint.Checked = false;
             if (_txtReadBreakpoint != null) _txtReadBreakpoint.BackColor = _themeWindowBack;
@@ -1002,79 +1259,6 @@ namespace PS2Disassembler
             try
             {
                 ClearFrozenBreakpointUi();
-
-                // First, reconcile the server to the current UI/model state. This makes the
-                // common "uncheck OnRead/OnWrite, then click Continue" path authoritative even if
-                // PCSX2 still has a stale memcheck armed from the previous hit.
-                bool resumeAfterMutation = false;
-                try
-                {
-                    PauseVmForBreakpointMutation(out resumeAfterMutation);
-                    SyncDesiredBreakpointsToServer();
-                }
-                finally
-                {
-                    RestoreVmAfterBreakpointMutation(resumeAfterMutation);
-                }
-
-                // If the emulator is currently stopped on either an execution breakpoint or an
-                // still-armed read/write watchpoint, step once with the watchpoints temporarily
-                // removed so we do not immediately retrigger on the same access when the user
-                // presses Continue. If the watchpoint was already unchecked, skip the step and
-                // just resume.
-                var savedBreakpoints = new List<uint>(_userBreakpoints);
-                bool watchpointsSuspended = false;
-                bool removedBreakpointsForStep = false;
-                try
-                {
-                    var status = _debugServer.GetStatus();
-                    uint currentPc = NormalizeMipsAddress(status.Pc);
-                    bool hasArmedWatchpoints = !_watchpointsSuspended &&
-                        ((_chkReadBreakpoint?.Checked == true && _readMemcheckAddress.HasValue) ||
-                         (_chkWriteBreakpoint?.Checked == true && _writeMemcheckAddress.HasValue));
-                    bool pausedOnExecBreakpoint = status.Paused && _userBreakpoints.Contains(currentPc);
-                    bool pausedOnWatchpoint = status.Paused && hasArmedWatchpoints &&
-                        (_activeBreakpointIsWatchpoint || _pausedBreakpointUiIsWatchpoint || _breakpointUiFrozenIsWatchpoint);
-
-                    if (pausedOnExecBreakpoint || pausedOnWatchpoint)
-                    {
-                        if (pausedOnWatchpoint)
-                            watchpointsSuspended = SuspendWatchpoints();
-
-                        try
-                        {
-                            foreach (uint bp in savedBreakpoints)
-                            {
-                                try { _debugServer.RemoveBreakpoint(bp); } catch { }
-                            }
-                            removedBreakpointsForStep = savedBreakpoints.Count != 0;
-                            _debugServer.Step();
-                        }
-                        finally
-                        {
-                            foreach (uint bp in savedBreakpoints)
-                            {
-                                try { _debugServer.SetBreakpoint(bp, description: $"ps2dis# {bp:X8}"); } catch { }
-                            }
-                            removedBreakpointsForStep = false;
-                        }
-                    }
-                }
-                catch { /* Non-fatal — resume anyway */ }
-                finally
-                {
-                    if (removedBreakpointsForStep)
-                    {
-                        foreach (uint bp in savedBreakpoints)
-                        {
-                            try { _debugServer.SetBreakpoint(bp, description: $"ps2dis# {bp:X8}"); } catch { }
-                        }
-                    }
-
-                    if (watchpointsSuspended)
-                        ResumeWatchpoints();
-                }
-
                 _debugServer.Resume();
                 ClearPausedBreakpointUiState();
                 ClearPausedBreakpointMenuStatus();
@@ -1108,11 +1292,11 @@ namespace PS2Disassembler
                 // We read from live PINE data if available, otherwise fall back to file data.
                 uint word = 0;
                 bool gotWord = false;
-                if (_pineAvailable)
+                if (_pineAvailable && TryBuildEeRamRange(normalizedPc, 4u, out uint pineReadPc, out _))
                 {
                     try
                     {
-                        byte[] buf = _pine.ReadMemory(normalizedPc, 4);
+                        byte[] buf = _pine.ReadMemory(pineReadPc, 4);
                         if (buf != null && buf.Length >= 4)
                         {
                             word = BitConverter.ToUInt32(buf, 0);
@@ -1190,8 +1374,13 @@ namespace PS2Disassembler
                     tempBreakpoints.Add(normalizedPc + 4);
                 }
 
-                // Remove duplicates and the current PC
-                var uniqueTargets = new HashSet<uint>(tempBreakpoints);
+                // Remove duplicates, invalid EE targets, and the current PC
+                var uniqueTargets = new HashSet<uint>();
+                foreach (uint targetAddress in tempBreakpoints)
+                {
+                    if (TryNormalizeInstructionBreakpoint(targetAddress, out uint normalizedTarget))
+                        uniqueTargets.Add(normalizedTarget);
+                }
                 uniqueTargets.Remove(normalizedPc);
 
                 if (uniqueTargets.Count == 0)
@@ -1412,16 +1601,7 @@ namespace PS2Disassembler
                 {
                     if (oldAddress.HasValue && EnsureDebugServerConnected(forceRetry: false))
                     {
-                        bool resumeAfterMutation = false;
-                        try
-                        {
-                            PauseVmForBreakpointMutation(out resumeAfterMutation);
-                            SyncDesiredBreakpointsToServer();
-                        }
-                        finally
-                        {
-                            RestoreVmAfterBreakpointMutation(resumeAfterMutation);
-                        }
+                        SyncDesiredBreakpointsToServer();
                     }
                 }
                 catch
@@ -1458,15 +1638,15 @@ namespace PS2Disassembler
 
             try
             {
-                // Validate address is within PS2 EE RAM range (0 to 32MB)
-                const uint EE_RAM_SIZE = 0x02000000;
-                if (address >= EE_RAM_SIZE)
+                if (!TryBuildWatchpointRange(address, out uint normalizedAddress, out _))
                 {
                     txt.BackColor = _themeEditInvalidBack;
                     if (showErrors)
-                        MessageBox.Show($"Address 0x{address:X8} is outside EE RAM (0-{EE_RAM_SIZE:X8}).", isRead ? "OnRead" : "OnWrite", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        MessageBox.Show($"Address 0x{address:X8} is outside EE RAM or would cross the EE RAM boundary.", isRead ? "OnRead" : "OnWrite", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
+
+                address = normalizedAddress;
 
                 uint? previousReadAddress = _readMemcheckAddress;
                 uint? previousWriteAddress = _writeMemcheckAddress;
@@ -1486,10 +1666,8 @@ namespace PS2Disassembler
                 }
                 _watchpointsSuspended = false;
 
-                bool resumeAfterMutation = false;
                 try
                 {
-                    PauseVmForBreakpointMutation(out resumeAfterMutation);
                     SyncDesiredBreakpointsToServer();
                 }
                 catch
@@ -1500,10 +1678,6 @@ namespace PS2Disassembler
                     _writeMemcheckHits = previousWriteHits;
                     _watchpointsSuspended = previousWatchpointsSuspended;
                     throw;
-                }
-                finally
-                {
-                    RestoreVmAfterBreakpointMutation(resumeAfterMutation);
                 }
 
                 txt.Text = address.ToString("X8");
@@ -1611,30 +1785,30 @@ namespace PS2Disassembler
 
             try
             {
-                // Pause before setting memcheck
-                bool wasRunning = false;
+                if (!TryBuildAccessMonitorRange(address, out uint normalizedAddress, out uint endAddress))
+                {
+                    MessageBox.Show($"Access monitor range 0x{address:X8} + {_accessMonitorSizeBytes} byte(s) is outside EE RAM or crosses the EE RAM boundary.",
+                        "Access Monitor", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                address = normalizedAddress;
+
+                if (!TryPauseDebugServerForMutation("setting the access monitor", out bool resumeAfterMutation, out string? pauseError))
+                    throw new IOException(pauseError ?? "Could not pause PCSX2 before setting the access monitor.");
+
                 try
                 {
-                    var st = _debugServer.GetStatus();
-                    wasRunning = !st.Paused;
-                    if (wasRunning)
-                    {
-                        _debugServer.Pause();
-                        for (int i = 0; i < 20; i++)
-                        {
-                            System.Threading.Thread.Sleep(10);
-                            try { if (_debugServer.GetStatus().Paused) break; } catch { }
-                        }
-                    }
+                    try { _debugServer.RemoveMemcheck(address, endAddress); } catch { }
+
+                    _debugServer.SetMemcheck(address, endAddress, _accessMonitorType,
+                        action: "break", description: "ps2dis# AccessMonitor");
+                    _accessMonitorMemcheckInstalled = true;
                 }
-                catch { }
-
-                uint endAddress = GetAccessMonitorEndAddress(address);
-                try { _debugServer.RemoveMemcheck(address, endAddress); } catch { }
-
-                _debugServer.SetMemcheck(address, endAddress, _accessMonitorType,
-                    action: "break", description: "ps2dis# AccessMonitor");
-                _accessMonitorMemcheckInstalled = true;
+                finally
+                {
+                    ResumeDebugServerAfterMutation(resumeAfterMutation);
+                }
 
                 _accessMonitorAddress = address;
                 _accessMonitorAddressValid = true;
@@ -1656,9 +1830,6 @@ namespace PS2Disassembler
                 _accessMonitorRearmUtc = DateTime.MinValue;
                 _accessMonitorBurstWindowUtc = DateTime.MinValue;
 
-                if (wasRunning)
-                    try { _debugServer.Resume(); } catch { }
-
                 _nextDebuggerPollUtc = DateTime.UtcNow.AddMilliseconds(20);
                 ShowAccessMonitorForm();
                 RefreshAccessMonitorList();
@@ -1670,7 +1841,7 @@ namespace PS2Disassembler
             }
         }
 
-        private void StopAccessMonitor(bool quiet = false)
+        private void StopAccessMonitor(bool quiet = false, bool resumeIfPaused = true)
         {
             if (!_accessMonitorActive) return;
 
@@ -1686,14 +1857,30 @@ namespace PS2Disassembler
             _accessMonitorLastObservedPc = 0;
             if (EnsureDebugServerConnected(forceRetry: false))
             {
-                try { _debugServer.RemoveMemcheck(_accessMonitorAddress, GetAccessMonitorEndAddress(_accessMonitorAddress)); } catch { }
-                // Resume PCSX2 if it's currently paused (likely mid-memcheck hit)
+                bool resumeAfterMutation = false;
+                bool pausedForRemoval = TryPauseDebugServerForMutation("stopping the access monitor", out resumeAfterMutation, out _);
                 try
                 {
-                    var st = _debugServer.GetStatus();
-                    if (st.Paused) _debugServer.Resume();
+                    if (pausedForRemoval)
+                        try { _debugServer.RemoveMemcheck(_accessMonitorAddress, GetAccessMonitorEndAddress(_accessMonitorAddress)); } catch { }
                 }
-                catch { }
+                finally
+                {
+                    if (resumeIfPaused)
+                    {
+                        // Resume PCSX2 if it was already paused on a memcheck hit, or if we paused it for safe removal.
+                        try
+                        {
+                            var st = _debugServer.GetStatus();
+                            if (st.Paused) _debugServer.Resume();
+                        }
+                        catch { }
+                    }
+                    else
+                    {
+                        ResumeDebugServerAfterMutation(resumeAfterMutation);
+                    }
+                }
             }
 
             // Final UI refresh to show accumulated counts
@@ -1931,17 +2118,34 @@ namespace PS2Disassembler
 
             try
             {
-                uint endAddress = GetAccessMonitorEndAddress(_accessMonitorAddress);
+                if (!TryBuildAccessMonitorRange(_accessMonitorAddress, out uint accessStart, out uint endAddress))
+                {
+                    _accessMonitorActive = false;
+                    _accessMonitorMemcheckInstalled = false;
+                    return;
+                }
+
+                _accessMonitorAddress = accessStart;
+                if (!TryPauseDebugServerForMutation("switching the access monitor to break mode", out bool resumeAfterMutation, out _))
+                    return;
+
                 try
                 {
-                    if (_accessMonitorMemcheckInstalled)
-                        _debugServer.RemoveMemcheck(_accessMonitorAddress, endAddress);
-                }
-                catch { }
+                    try
+                    {
+                        if (_accessMonitorMemcheckInstalled)
+                            _debugServer.RemoveMemcheck(_accessMonitorAddress, endAddress);
+                    }
+                    catch { }
 
-                _debugServer.SetMemcheck(_accessMonitorAddress, endAddress, _accessMonitorType,
-                    action: "break", description: "ps2dis# AccessMonitor");
-                _accessMonitorMemcheckInstalled = true;
+                    _debugServer.SetMemcheck(_accessMonitorAddress, endAddress, _accessMonitorType,
+                        action: "break", description: "ps2dis# AccessMonitor");
+                    _accessMonitorMemcheckInstalled = true;
+                }
+                finally
+                {
+                    ResumeDebugServerAfterMutation(resumeAfterMutation);
+                }
                 _accessMonitorPassiveMode = false;
                 _accessMonitorNeedsRearm = false;
                 _accessMonitorPassiveMissingPolls = 0;
@@ -1997,7 +2201,11 @@ namespace PS2Disassembler
                     pausedForRearm = true;
                 }
 
-                _debugServer.SetMemcheck(_accessMonitorAddress, GetAccessMonitorEndAddress(_accessMonitorAddress), _accessMonitorType,
+                if (!TryBuildAccessMonitorRange(_accessMonitorAddress, out uint accessStart, out uint accessEnd))
+                    return;
+
+                _accessMonitorAddress = accessStart;
+                _debugServer.SetMemcheck(accessStart, accessEnd, _accessMonitorType,
                     action: "break", description: "ps2dis# AccessMonitor");
                 _accessMonitorMemcheckInstalled = true;
                 _accessMonitorNeedsRearm = false;
@@ -2626,7 +2834,9 @@ namespace PS2Disassembler
             if (length <= 0)
                 return false;
 
-            uint normalizedAddress = NormalizeMipsAddress(address);
+            if (!TryBuildEeRamRange(address, (uint)length, out uint normalizedAddress, out _))
+                return false;
+
             bool preferDirectRead = normalizedAddress < 0x00100000u;
 
             if (preferDirectRead && TryReadEeMemoryDirect(normalizedAddress, length, out data))
@@ -2658,6 +2868,8 @@ namespace PS2Disassembler
         private bool TryReadEeMemoryDirect(uint normalizedAddress, int length, out byte[] data)
         {
             data = Array.Empty<byte>();
+            if (!TryBuildEeRamRange(normalizedAddress, (uint)Math.Max(0, length), out normalizedAddress, out _))
+                return false;
             if (_liveProcId == 0 || _eeHostAddr == 0)
                 return false;
 
@@ -3036,6 +3248,325 @@ namespace PS2Disassembler
             _activeBreakpointAddress = null;
             _activeBreakpointIsWatchpoint = false;
             _lastDebuggerPaused = false;
+            // Drop the cached register snapshot so the live break-time
+            // annotations on rows around the active break PC are not displayed
+            // after the VM resumes.
+            _breakRegisterSnapshot = null;
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Live break-time annotations (visible rows around active break)
+        // ──────────────────────────────────────────────────────────────────
+        //
+        // While paused at a breakpoint, visible disassembler rows can get
+        // live annotations backed by the cached register snapshot. Each row is
+        // checked for control-flow barriers and intervening register writes so
+        // values are only shown when the break-time state still makes sense
+        // for that instruction.
+
+        /// <summary>
+        /// Returns true when a live register snapshot is available (the VM is
+        /// currently paused at a ps2dis#-tracked break) and <paramref name="rowIdx"/>
+        /// is currently visible in the disassembler. Individual annotation builders
+        /// still perform flow/data-dependency checks before using break-time values.
+        /// </summary>
+        internal bool IsBreakAnnotationRow(int rowIdx)
+        {
+            if (!TryGetActiveBreakpointRowIndex(out _))
+                return false;
+
+            if (rowIdx < 0 || rowIdx >= _rows.Count)
+                return false;
+
+            int top = Math.Max(0, Math.Min(_disasmList.TopIndex, Math.Max(0, _rows.Count - 1)));
+            int visible = Math.Max(1, _disasmList.VisibleRowCapacity);
+            int bottom = Math.Min(_rows.Count - 1, top + visible); // include a partially visible trailing row
+            return rowIdx >= top && rowIdx <= bottom;
+        }
+
+        internal bool TryGetActiveBreakpointRowIndex(out int activeIdx)
+        {
+            activeIdx = -1;
+            if (_breakRegisterSnapshot == null || !_activeBreakpointAddress.HasValue)
+                return false;
+
+            uint activeAddr = NormalizeMipsAddress(_activeBreakpointAddress.Value);
+            return TryGetRowIndexByAddress(activeAddr, out activeIdx);
+        }
+
+        internal bool TryComputeBreakDataAddressForRow(uint instructionWord, int rowIdx, out uint address)
+        {
+            address = 0;
+            if (!TryGetActiveBreakpointRowIndex(out int activeIdx))
+                return false;
+
+            uint op = (instructionWord >> 26) & 0x3F;
+            uint rs = (instructionWord >> 21) & 0x1F;
+            uint ui = instructionWord & 0xFFFF;
+
+            if (op == 0x0F)
+            {
+                address = ui << 16;
+                return true;
+            }
+
+            bool isLoadStore = IsLoadStore(op);
+            bool isAddressBuilder = op is 0x08 or 0x09 or 0x0D;
+            if (!isLoadStore && !isAddressBuilder)
+                return false;
+
+            if (!CanUseBreakSourceGprForRow(rowIdx, activeIdx, rs))
+                return false;
+
+            address = ComputeBreakDataAddress(instructionWord);
+            return address != 0;
+        }
+
+        internal bool TryGetBreakDestinationValueForRow(int rowIdx, uint instructionWord, out uint destReg, out uint value)
+        {
+            destReg = 0;
+            value = 0;
+            if (!TryGetActiveBreakpointRowIndex(out int activeIdx) || rowIdx >= activeIdx)
+                return false;
+
+            destReg = GetDestinationGpr(instructionWord);
+            if (destReg == 0 || !CanUsePastBreakRow(rowIdx, activeIdx))
+                return false;
+
+            for (int i = rowIdx + 1; i < activeIdx; i++)
+            {
+                if (WritesGprForBreakSnapshot(_rows[i].Word, destReg))
+                    return false;
+            }
+
+            return TryGetBreakGpr(destReg, out value);
+        }
+
+        internal bool HasBreakMemoryWriteBetween(int startInclusive, int endExclusive)
+        {
+            startInclusive = Math.Max(0, startInclusive);
+            endExclusive = Math.Min(_rows.Count, endExclusive);
+            for (int i = startInclusive; i < endExclusive; i++)
+            {
+                uint op = (_rows[i].Word >> 26) & 0x3F;
+                if (TryGetLoadStoreAccessSpec(op, out string accessType, out _) &&
+                    string.Equals(accessType, "write", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool CanUseBreakSourceGprForRow(int rowIdx, int activeIdx, uint reg)
+        {
+            if (rowIdx < 0 || rowIdx >= _rows.Count)
+                return false;
+
+            if (rowIdx == activeIdx || reg == 0)
+                return true;
+
+            if (rowIdx < activeIdx)
+            {
+                if (!CanUsePastBreakRow(rowIdx, activeIdx))
+                    return false;
+
+                for (int i = rowIdx; i < activeIdx; i++)
+                {
+                    if (WritesGprForBreakSnapshot(_rows[i].Word, reg))
+                        return false;
+                }
+                return true;
+            }
+
+            if (!CanUseFutureBreakRow(rowIdx, activeIdx))
+                return false;
+
+            for (int i = activeIdx; i < rowIdx; i++)
+            {
+                if (WritesGprForBreakSnapshot(_rows[i].Word, reg))
+                    return false;
+            }
+            return true;
+        }
+
+        private bool CanUsePastBreakRow(int rowIdx, int activeIdx)
+        {
+            if (rowIdx < 0 || activeIdx < 0 || rowIdx > activeIdx)
+                return false;
+            if (rowIdx == activeIdx)
+                return true;
+
+            // Include rowIdx - 1 so a branch/call's delay slot is not annotated
+            // with post-call register values. Example: jal; delay-slot; break.
+            return !HasControlFlowBarrierBetween(Math.Max(0, rowIdx - 1), activeIdx);
+        }
+
+        private bool CanUseFutureBreakRow(int rowIdx, int activeIdx)
+        {
+            if (rowIdx < activeIdx)
+                return false;
+            if (rowIdx == activeIdx)
+                return true;
+
+            for (int i = activeIdx; i < rowIdx; i++)
+            {
+                if (!IsControlFlowBarrierRow(i))
+                    continue;
+
+                // The instruction immediately after a branch/call/jump is the delay
+                // slot, so using the break snapshot can still make sense there.
+                return i == activeIdx && rowIdx == activeIdx + 1;
+            }
+
+            return true;
+        }
+
+        private bool HasControlFlowBarrierBetween(int startInclusive, int endExclusive)
+        {
+            startInclusive = Math.Max(0, startInclusive);
+            endExclusive = Math.Min(_rows.Count, endExclusive);
+            for (int i = startInclusive; i < endExclusive; i++)
+            {
+                if (IsControlFlowBarrierRow(i))
+                    return true;
+            }
+            return false;
+        }
+
+        private bool IsControlFlowBarrierRow(int rowIdx)
+        {
+            if (rowIdx < 0 || rowIdx >= _rows.Count)
+                return false;
+
+            return _rows[rowIdx].Kind is InstructionType.Branch or InstructionType.Jump or InstructionType.Call;
+        }
+
+        private static bool WritesGprForBreakSnapshot(uint word, uint reg)
+        {
+            if (reg == 0)
+                return false;
+
+            return WritesRegister(word, reg) || GetDestinationGpr(word) == reg;
+        }
+
+        /// <summary>
+        /// Reads register <paramref name="regIndex"/> (0..31) from the cached
+        /// break-time snapshot. Returns false when no snapshot is cached.
+        /// </summary>
+        internal bool TryGetBreakGpr(uint regIndex, out uint value)
+        {
+            value = 0;
+            if (_breakRegisterSnapshot == null)
+                return false;
+            uint? v = FindGprAddress(_breakRegisterSnapshot, regIndex);
+            if (!v.HasValue)
+                return false;
+            value = v.Value;
+            return true;
+        }
+
+        /// <summary>
+        /// Computes the effective memory address that the load/store or address-
+        /// builder instruction on <paramref name="rowIdx"/> will use, given the
+        /// live register state captured at the most recent break. Returns 0
+        /// when the row is not a memory access or no live snapshot is cached.
+        /// </summary>
+        internal uint ComputeBreakDataAddress(uint instructionWord)
+        {
+            if (_breakRegisterSnapshot == null)
+                return 0;
+
+            uint w = instructionWord;
+            uint op = (w >> 26) & 0x3F;
+            uint rs = (w >> 21) & 0x1F;
+            int si = (short)(w & 0xFFFF);
+            uint ui = w & 0xFFFF;
+
+            // LUI: not a base-register access — return the upper-half it loads.
+            if (op == 0x0F)
+                return ui << 16;
+
+            bool isLoadStore = IsLoadStore(op);
+            bool isAddrBuild = op is 0x08 or 0x09 or 0x0D;
+            if (!isLoadStore && !isAddrBuild)
+                return 0;
+
+            if (rs == 0)
+            {
+                // base = $zero — the immediate IS the address.
+                if (op == 0x0D) return ui;       // ori from zero: low half
+                return unchecked((uint)si);      // addiu/addi/load/store from zero
+            }
+
+            if (!TryGetBreakGpr(rs, out uint baseValue))
+                return 0;
+
+            return op == 0x0D ? (baseValue | ui) : unchecked(baseValue + (uint)si);
+        }
+
+        /// <summary>
+        /// Returns the GPR index that <paramref name="instructionWord"/> writes
+        /// (for the purpose of the "show destination current value" annotation
+        /// on the row above the break). Returns 0 when the instruction has no
+        /// GPR destination, or writes to $zero (which is meaningless to show).
+        /// </summary>
+        internal static uint GetDestinationGpr(uint instructionWord)
+        {
+            uint op = (instructionWord >> 26) & 0x3F;
+            uint rt = (instructionWord >> 16) & 0x1F;
+            uint rd = (instructionWord >> 11) & 0x1F;
+            uint fn = instructionWord & 0x3F;
+
+            // R-type
+            if (op == 0x00)
+            {
+                // sll/srl/sra/sllv/srlv/srav/movz/movn/mfhi/mflo/mthi/mtlo/
+                // mult/div/add/addu/sub/subu/and/or/xor/nor/slt/sltu/
+                // dadd/daddu/dsub/dsubu/dsll/dsrl/dsra/dsll32/dsrl32/dsra32
+                switch (fn)
+                {
+                    case 0x00: case 0x02: case 0x03:                       // sll, srl, sra
+                    case 0x04: case 0x06: case 0x07:                       // sllv, srlv, srav
+                    case 0x0A: case 0x0B:                                  // movz, movn
+                    case 0x10: case 0x12:                                  // mfhi, mflo
+                    case 0x20: case 0x21: case 0x22: case 0x23:            // add, addu, sub, subu
+                    case 0x24: case 0x25: case 0x26: case 0x27:            // and, or, xor, nor
+                    case 0x2A: case 0x2B:                                  // slt, sltu
+                    case 0x2C: case 0x2D: case 0x2E: case 0x2F:            // dadd, daddu, dsub, dsubu
+                    case 0x14: case 0x16: case 0x17:                       // dsllv, dsrlv, dsrav
+                    case 0x38: case 0x3A: case 0x3B:                       // dsll, dsrl, dsra
+                    case 0x3C: case 0x3E: case 0x3F:                       // dsll32, dsrl32, dsra32
+                        return rd;
+                    case 0x09:                                             // jalr — writes rd (default ra)
+                        return rd == 0 ? 31u : rd;
+                }
+                return 0;
+            }
+
+            // I-type with rt destination: addi, addiu, slti, sltiu, andi, ori,
+            // xori, lui, daddi, daddiu — and all loads.
+            if (op is 0x08 or 0x09 or 0x0A or 0x0B
+                   or 0x0C or 0x0D or 0x0E or 0x0F
+                   or 0x18 or 0x19)
+                return rt;
+
+            // jal: writes to ra
+            if (op == 0x03)
+                return 31;
+
+            // Loads write rt, but only the integer-loads — lwc1 / lqc2 write
+            // to FPR / VU registers, not GPRs, so skip them here.
+            if (IsLoadStore(op))
+            {
+                bool isStore = op is 0x28 or 0x29 or 0x2A or 0x2B or 0x2C or 0x2D
+                                  or 0x2E or 0x2F or 0x39 or 0x3E or 0x3F or 0x1F;
+                bool isFprLoad = op is 0x31 or 0x36;
+                if (!isStore && !isFprLoad)
+                    return rt;
+            }
+
+            return 0;
         }
 
 
