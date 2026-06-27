@@ -57,6 +57,9 @@ namespace PS2Disassembler
 
         // ASCII byte bar above disassembler
         private Panel? _asciiBytesBar;
+        private int _asciiBarSelAnchor = -1;
+        private int _asciiBarSelCurrent = -1;
+        private bool _asciiBarSelecting;
 
         private bool _showHex   = true;
         private bool _showBytes = false;
@@ -89,6 +92,8 @@ namespace PS2Disassembler
         private readonly PineIpcClient _pine = new();
         private bool _pineAvailable;
         private DateTime _nextPineRetryUtc = DateTime.MinValue;
+        private DateTime _nextLiveAttachmentProcessCheckUtc = DateTime.MinValue;
+        private bool _lastLiveAttachmentProcessAlive;
         private PineDebugWindow? _pineDebugWindow;
         private readonly Queue<string> _pineLogBacklog = new();
 
@@ -720,6 +725,7 @@ namespace PS2Disassembler
             _mainTabs.SelectedIndexChanged += (_, _) =>
             {
                 SyncMainViewMenuState();
+                UpdateStartPanelVisibility();
                 int idx = _mainTabs.SelectedIndex;
                 // Recalculate hex rows when switching to Memory View
                 if (idx == 1)
@@ -768,6 +774,8 @@ namespace PS2Disassembler
             _mainTabs.AddPage(_codeDesignerPage);
             _mainTabs.SetTabEnabled(2, false); // Code Manager disabled until attached to PCSX2
             _mainTabs.SetTabVisible(2, false); // and invisible until attached
+            _mainTabs.SetTabEnabled(3, true);  // Code Designer stays accessible unless the user hides it
+            _mainTabs.SetTabVisible(3, _appSettings?.ShowCodeDesigner ?? AppSettings.DefaultShowCodeDesigner);
 
             // Disassembler tab: ASCII byte bar + disassembly view fills the page.
             _asciiBytesBar = new DoubleBufferedPanel
@@ -775,8 +783,26 @@ namespace PS2Disassembler
                 Dock = DockStyle.Top,
                 Height = CurrentDisasmRowHeight,
                 BackColor = ColHexBg,
+                Cursor = Cursors.IBeam,
+                TabStop = true,
             };
             _asciiBytesBar.Paint += PaintAsciiBytesBar;
+            _asciiBytesBar.MouseDown += OnAsciiBytesBarMouseDown;
+            _asciiBytesBar.MouseMove += OnAsciiBytesBarMouseMove;
+            _asciiBytesBar.MouseUp += OnAsciiBytesBarMouseUp;
+            _asciiBytesBar.KeyDown += OnAsciiBytesBarKeyDown;
+            _asciiBytesBar.KeyPress += OnAsciiBytesBarKeyPress;
+            var asciiBytesCtx = new ContextMenuStrip();
+            var miAsciiCopy = new ToolStripMenuItem("Copy", null, (_, _) => CopyAsciiBytesBarSelection());
+            var miAsciiPaste = new ToolStripMenuItem("Paste", null, (_, _) => PasteAsciiBytesBarTextFromClipboard());
+            asciiBytesCtx.Items.Add(miAsciiCopy);
+            asciiBytesCtx.Items.Add(miAsciiPaste);
+            asciiBytesCtx.Opening += (_, e) =>
+            {
+                miAsciiCopy.Enabled = HasAsciiBytesBarSelection();
+                miAsciiPaste.Enabled = Clipboard.ContainsText();
+            };
+            _asciiBytesBar.ContextMenuStrip = asciiBytesCtx;
             _disasmList.Dock = DockStyle.Fill;
             tpDisasm.Controls.Add(_disasmList);
             tpDisasm.Controls.Add(_asciiBytesBar);
@@ -948,7 +974,11 @@ namespace PS2Disassembler
             if (_startPanel == null || _startPanel.IsDisposed)
                 return;
 
-            bool show = _fileData == null;
+            bool showCodeDesigner = _appSettings?.ShowCodeDesigner ?? AppSettings.DefaultShowCodeDesigner;
+            bool showTabsInTitleBar = _appSettings?.ShowTabsInTitleBar ?? AppSettings.DefaultShowTabsInTitleBar;
+            bool codeDesignerSelected = _mainTabs != null && _mainTabs.SelectedIndex == 3 && showCodeDesigner;
+            bool codeDesignerReachableFromVisibleTabStrip = _mainTabs != null && showCodeDesigner && !showTabsInTitleBar;
+            bool show = _fileData == null && !codeDesignerSelected && !codeDesignerReachableFromVisibleTabStrip;
             _startPanel.Visible = show;
             if (show)
             {
@@ -1008,10 +1038,16 @@ namespace PS2Disassembler
                 _miCodeManagerMenu.Checked = showTabsInTitleBar && showCodeManager && selectedIndex == 2;
             }
 
+            if (_mainTabs != null && _mainTabs.Pages.Count > 3)
+            {
+                _mainTabs.SetTabEnabled(3, true);
+                _mainTabs.SetTabVisible(3, showCodeDesigner);
+            }
+
             if (_miCodeDesignerMenu != null)
             {
                 _miCodeDesignerMenu.Visible = showTabsInTitleBar && showCodeDesigner;
-                _miCodeDesignerMenu.Enabled = showCodeDesigner;
+                _miCodeDesignerMenu.Enabled = true;
                 _miCodeDesignerMenu.Checked = showTabsInTitleBar && showCodeDesigner && selectedIndex == 3;
             }
         }

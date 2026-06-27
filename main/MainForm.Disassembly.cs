@@ -128,12 +128,45 @@ namespace PS2Disassembler
             return changedRows;
         }
 
+        private bool HasLiveAttachment()
+        {
+            // A PINE/MCP socket by itself is not enough to mean this disassembly is a
+            // live PCSX2 session. Live-only UI should only enable after AttachToPcsx2
+            // has found a PCSX2 process, resolved EE RAM, and installed that snapshot.
+            return _fileData != null && _liveProcId != 0 && _eeHostAddr != 0;
+        }
+
+        private bool IsAttachedPcsx2ProcessAliveCached()
+        {
+            if (_liveProcId == 0)
+                return false;
+
+            DateTime nowUtc = DateTime.UtcNow;
+            if (nowUtc < _nextLiveAttachmentProcessCheckUtc)
+                return _lastLiveAttachmentProcessAlive;
+
+            bool alive = false;
+            try
+            {
+                using Process proc = Process.GetProcessById(unchecked((int)_liveProcId));
+                string processName = proc.ProcessName ?? string.Empty;
+                alive = !proc.HasExited &&
+                        (string.Equals(processName, "pcsx2", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(processName, "pcsx2-qt", StringComparison.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                alive = false;
+            }
+
+            _lastLiveAttachmentProcessAlive = alive;
+            _nextLiveAttachmentProcessCheckUtc = nowUtc.AddSeconds(1);
+            return alive;
+        }
+
         private bool IsLiveAttached()
         {
-            // A PINE socket by itself is not enough to mean this disassembly is a
-            // live PCSX2 session. Code Manager and live-only UI should only enable
-            // after AttachToPcsx2 has found the process and EE RAM base.
-            return _fileData != null && _liveProcId != 0 && _eeHostAddr != 0;
+            return HasLiveAttachment() && IsAttachedPcsx2ProcessAliveCached();
         }
 
         private DisassemblyRow GetLiveDisplayRow(int rowIndex)
@@ -1605,30 +1638,301 @@ namespace PS2Disassembler
             using var bgBr = new SolidBrush(ColHexBg);
             e.Graphics.FillRectangle(bgBr, bar.ClientRectangle);
 
-            if (_fileData == null || _selRow < 0 || _selRow >= _rows.Count)
+            if (!TryGetAsciiBytesBarLayout(out int startOffset, out int count, out int charW))
                 return;
 
-            uint addr = _rows[_selRow].Address;
-            long off = (long)addr - _baseAddr;
-            if (off < 0) return;
-
-            int barW = bar.ClientSize.Width;
-            int charW = TextRenderer.MeasureText("X", _mono, new Size(999, 99), TextFormatFlags.NoPadding).Width;
-            if (charW < 1) charW = 7;
-            int maxChars = barW / charW;
-            int count = Math.Min(maxChars, (int)Math.Min(_fileData.Length - off, maxChars));
-
+            bool hasSelection = TryGetAsciiBytesBarSelectionBounds(out int selMin, out int selMax);
             var flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
             for (int i = 0; i < count; i++)
             {
-                int byteOff = (int)off + i;
-                if (byteOff >= _fileData.Length) break;
+                int byteOff = startOffset + i;
+                if (_fileData == null || byteOff >= _fileData.Length) break;
                 byte b = _fileData[byteOff];
                 char ch = (b >= 0x20 && b <= 0x7E) ? (char)b : '.';
-                Color fg = (b == 0) ? ColZeroByte : ColAscii;
+                bool selected = hasSelection && byteOff >= selMin && byteOff <= selMax;
                 var charRect = new Rectangle(i * charW, 0, charW, bar.ClientSize.Height);
+                if (selected)
+                {
+                    using var selBr = new SolidBrush(ColSel);
+                    e.Graphics.FillRectangle(selBr, charRect);
+                }
+                Color fg = selected ? ColSelFg : (b == 0 ? ColZeroByte : ColAscii);
                 TextRenderer.DrawText(e.Graphics, ch.ToString(), _mono, charRect, fg, flags);
             }
+        }
+
+        private bool TryGetAsciiBytesBarLayout(out int startOffset, out int count, out int charW)
+        {
+            startOffset = 0;
+            count = 0;
+            charW = TextRenderer.MeasureText("X", _mono, new Size(999, 99), TextFormatFlags.NoPadding).Width;
+            if (charW < 1) charW = 7;
+
+            if (_asciiBytesBar == null || _fileData == null || _selRow < 0 || _selRow >= _rows.Count)
+                return false;
+
+            long off = (long)_rows[_selRow].Address - _baseAddr;
+            if (off < 0 || off >= _fileData.Length)
+                return false;
+
+            int maxChars = Math.Max(0, _asciiBytesBar.ClientSize.Width / charW);
+            startOffset = (int)off;
+            count = Math.Min(maxChars, _fileData.Length - startOffset);
+            return count > 0;
+        }
+
+        private int AsciiBytesBarHitTestOffset(int x)
+        {
+            if (!TryGetAsciiBytesBarLayout(out int startOffset, out int count, out int charW) || count <= 0)
+                return -1;
+
+            int charIndex = Math.Max(0, Math.Min(count - 1, x / Math.Max(1, charW)));
+            return startOffset + charIndex;
+        }
+
+        private bool TryGetAsciiBytesBarSelectionBounds(out int selMin, out int selMax)
+        {
+            selMin = selMax = -1;
+            if (_fileData == null || _asciiBarSelAnchor < 0 || _asciiBarSelCurrent < 0)
+                return false;
+
+            selMin = Math.Max(0, Math.Min(_asciiBarSelAnchor, _asciiBarSelCurrent));
+            selMax = Math.Min(_fileData.Length - 1, Math.Max(_asciiBarSelAnchor, _asciiBarSelCurrent));
+            return selMin <= selMax;
+        }
+
+        private bool HasAsciiBytesBarSelection()
+            => TryGetAsciiBytesBarSelectionBounds(out _, out _);
+
+        private bool AsciiBytesBarSelectionContains(int byteOffset)
+            => TryGetAsciiBytesBarSelectionBounds(out int selMin, out int selMax) &&
+               byteOffset >= selMin && byteOffset <= selMax;
+
+        private void ClearAsciiBytesBarSelection(bool invalidate = true)
+        {
+            _asciiBarSelAnchor = -1;
+            _asciiBarSelCurrent = -1;
+            _asciiBarSelecting = false;
+            if (invalidate) _asciiBytesBar?.Invalidate();
+        }
+
+        private void OnAsciiBytesBarMouseDown(object? sender, MouseEventArgs e)
+        {
+            if (_asciiBytesBar == null) return;
+
+            _asciiBytesBar.Focus();
+            int offset = AsciiBytesBarHitTestOffset(e.X);
+            if (offset < 0) return;
+
+            if (e.Button == MouseButtons.Left)
+            {
+                _asciiBarSelAnchor = offset;
+                _asciiBarSelCurrent = offset;
+                _asciiBarSelecting = true;
+                _asciiBytesBar.Capture = true;
+                _asciiBytesBar.Invalidate();
+            }
+            else if (e.Button == MouseButtons.Right)
+            {
+                if (!AsciiBytesBarSelectionContains(offset))
+                {
+                    _asciiBarSelAnchor = offset;
+                    _asciiBarSelCurrent = offset;
+                    _asciiBytesBar.Invalidate();
+                }
+            }
+        }
+
+        private void OnAsciiBytesBarMouseMove(object? sender, MouseEventArgs e)
+        {
+            if (!_asciiBarSelecting || e.Button != MouseButtons.Left)
+                return;
+
+            int offset = AsciiBytesBarHitTestOffset(e.X);
+            if (offset < 0 || offset == _asciiBarSelCurrent)
+                return;
+
+            _asciiBarSelCurrent = offset;
+            _asciiBytesBar?.Invalidate();
+        }
+
+        private void OnAsciiBytesBarMouseUp(object? sender, MouseEventArgs e)
+        {
+            _asciiBarSelecting = false;
+            if (_asciiBytesBar != null)
+                _asciiBytesBar.Capture = false;
+        }
+
+        private bool IsAsciiBytesBarFocused()
+            => _asciiBytesBar != null && _asciiBytesBar.ContainsFocus;
+
+        private bool HandleAsciiBytesBarKeyDown(KeyEventArgs e)
+        {
+            if (e.Control && e.KeyCode == Keys.C)
+            {
+                CopyAsciiBytesBarSelection();
+                e.Handled = e.SuppressKeyPress = true;
+                return true;
+            }
+
+            if (e.Control && e.KeyCode == Keys.V)
+            {
+                PasteAsciiBytesBarTextFromClipboard();
+                e.Handled = e.SuppressKeyPress = true;
+                return true;
+            }
+
+            if (e.Control && e.KeyCode == Keys.A)
+            {
+                SelectAllVisibleAsciiBytesBarText();
+                e.Handled = e.SuppressKeyPress = true;
+                return true;
+            }
+
+            if (!e.Control && !e.Alt && e.KeyCode is Keys.Left or Keys.Right)
+            {
+                MoveAsciiBytesBarCaret(e.KeyCode == Keys.Right ? 1 : -1, e.Shift);
+                e.Handled = e.SuppressKeyPress = true;
+                return true;
+            }
+
+            return false;
+        }
+
+        private void OnAsciiBytesBarKeyDown(object? sender, KeyEventArgs e)
+            => HandleAsciiBytesBarKeyDown(e);
+
+        private void OnAsciiBytesBarKeyPress(object? sender, KeyPressEventArgs e)
+        {
+            if (char.IsControl(e.KeyChar))
+                return;
+
+            if (e.KeyChar < 0x20 || e.KeyChar > 0x7E)
+                return;
+
+            WriteAsciiBytesBarText(e.KeyChar.ToString());
+            e.Handled = true;
+        }
+
+        private void MoveAsciiBytesBarCaret(int delta, bool extendSelection)
+        {
+            if (!TryGetAsciiBytesBarLayout(out int startOffset, out int count, out _))
+                return;
+
+            int minVisible = startOffset;
+            int maxVisible = startOffset + count - 1;
+            int current = _asciiBarSelCurrent >= 0 ? _asciiBarSelCurrent : minVisible;
+            int next = Math.Max(minVisible, Math.Min(maxVisible, current + delta));
+            if (extendSelection)
+            {
+                if (_asciiBarSelAnchor < 0) _asciiBarSelAnchor = current;
+                _asciiBarSelCurrent = next;
+            }
+            else
+            {
+                _asciiBarSelAnchor = next;
+                _asciiBarSelCurrent = next;
+            }
+            _asciiBytesBar?.Invalidate();
+        }
+
+        private void SelectAllVisibleAsciiBytesBarText()
+        {
+            if (!TryGetAsciiBytesBarLayout(out int startOffset, out int count, out _) || count <= 0)
+                return;
+
+            _asciiBarSelAnchor = startOffset;
+            _asciiBarSelCurrent = startOffset + count - 1;
+            _asciiBytesBar?.Invalidate();
+        }
+
+        private void CopyAsciiBytesBarSelection()
+        {
+            if (_fileData == null || !TryGetAsciiBytesBarSelectionBounds(out int selMin, out int selMax))
+                return;
+
+            var sb = new StringBuilder(selMax - selMin + 1);
+            for (int i = selMin; i <= selMax; i++)
+            {
+                byte b = _fileData[i];
+                sb.Append(b >= 0x20 && b <= 0x7E ? (char)b : '.');
+            }
+
+            try { Clipboard.SetText(sb.ToString()); } catch { }
+        }
+
+        private void PasteAsciiBytesBarTextFromClipboard()
+        {
+            try
+            {
+                if (Clipboard.ContainsText())
+                    WriteAsciiBytesBarText(Clipboard.GetText());
+            }
+            catch { }
+        }
+
+        private static byte[] GetPrintableAsciiBytesForEdit(string text, int maxLength)
+        {
+            if (string.IsNullOrEmpty(text) || maxLength <= 0)
+                return Array.Empty<byte>();
+
+            var bytes = new List<byte>(Math.Min(text.Length, maxLength));
+            foreach (char ch in text)
+            {
+                if (bytes.Count >= maxLength)
+                    break;
+                if (ch == '\r' || ch == '\n')
+                    continue;
+                if (ch >= 0x20 && ch <= 0x7E)
+                    bytes.Add((byte)ch);
+            }
+            return bytes.ToArray();
+        }
+
+        private void WriteAsciiBytesBarText(string text)
+        {
+            if (_fileData == null || string.IsNullOrEmpty(text))
+                return;
+
+            int startOffset;
+            if (TryGetAsciiBytesBarSelectionBounds(out int selMin, out _))
+                startOffset = selMin;
+            else if (_asciiBarSelCurrent >= 0)
+                startOffset = _asciiBarSelCurrent;
+            else if (TryGetAsciiBytesBarLayout(out int visibleStart, out _, out _))
+                startOffset = visibleStart;
+            else
+                return;
+
+            if (startOffset < 0 || startOffset >= _fileData.Length)
+                return;
+
+            byte[] bytes = GetPrintableAsciiBytesForEdit(text, _fileData.Length - startOffset);
+            if (bytes.Length == 0)
+                return;
+
+            uint address = _baseAddr + (uint)startOffset;
+            var bytePatches = new List<(uint Addr, byte[] Bytes)>(bytes.Length);
+            for (int i = 0; i < bytes.Length; i++)
+                bytePatches.Add((address + (uint)i, new[] { bytes[i] }));
+
+            PatchFileDataAndRows(bytePatches);
+
+            if (IsLiveAttached())
+            {
+                string? err = WritePatchesToLivePcsx2([(address, bytes)]);
+                if (err != null)
+                    LogPine($"ASCII bar write failed at 0x{address:X8}: {err}");
+            }
+
+            int firstHexRow = startOffset / 16;
+            int lastHexRow = (startOffset + bytes.Length - 1) / 16;
+            InvalidateHexRowRange(firstHexRow, lastHexRow);
+
+            int nextOffset = Math.Min(_fileData.Length - 1, startOffset + bytes.Length);
+            _asciiBarSelAnchor = nextOffset;
+            _asciiBarSelCurrent = nextOffset;
+            _asciiBytesBar?.Invalidate();
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -1692,6 +1996,8 @@ namespace PS2Disassembler
             }
 
             _selRow = idx;
+            if (old != idx)
+                ClearAsciiBytesBarSelection(invalidate: false);
 
             int oldDest = _highlightDestIdx;
 
@@ -2199,6 +2505,14 @@ namespace PS2Disassembler
 
         private void OnFormKeyDown(object? s, KeyEventArgs e)
         {
+            if (IsAsciiBytesBarFocused())
+            {
+                if (HandleAsciiBytesBarKeyDown(e))
+                    return;
+                if (!e.Alt)
+                    return;
+            }
+
             if (e.Alt && e.KeyCode == Keys.A) { RunXrefAnalyzer(); e.Handled = e.SuppressKeyPress = true; return; }
             // Handle Space + F3 at form level so KeyPreview catches them before the ListView's Win32 internals
             if (!e.Control && !e.Alt && !e.Shift && e.KeyCode == Keys.Space && _disasmList.ContainsFocus)
@@ -2497,6 +2811,118 @@ namespace PS2Disassembler
 
                 if (firstIdx >= 0 && firstIdx < _rows.Count)
                     _disasmList.RedrawItems(firstIdx, firstIdx, true);
+            }
+            finally
+            {
+                _disasmList.EndUpdate();
+            }
+        }
+
+
+        private void ConvertAddressToDataKind(uint address, DataKind dataKind)
+        {
+            if (_fileData == null || _fileData.Length == 0)
+                return;
+
+            uint aligned = address & ~3u;
+            long off = (long)(aligned - _baseAddr);
+            if (off < 0 || off + 4 > _fileData.Length)
+                return;
+
+            if (!TryGetRowIndexByAddress(aligned, out int firstIdx))
+                return;
+
+            int count = 0;
+            while (firstIdx + count < _rows.Count &&
+                   _rows[firstIdx + count].Address >= aligned &&
+                   _rows[firstIdx + count].Address < aligned + 4)
+            {
+                count++;
+            }
+
+            if (count == 0)
+                return;
+
+            uint word = BitConverter.ToUInt32(_fileData, (int)off);
+            List<SlimRow> replacement = new List<SlimRow>(4);
+            switch (dataKind)
+            {
+                case DataKind.Byte:
+                    for (int i = 0; i < 4; i++)
+                        replacement.Add(SlimRow.DataRow(aligned + (uint)i, _fileData[(int)off + i], DataKind.Byte));
+                    break;
+                case DataKind.Half:
+                    replacement.Add(SlimRow.DataRow(aligned, (ushort)(word & 0xFFFF), DataKind.Half));
+                    replacement.Add(SlimRow.DataRow(aligned + 2, (ushort)(word >> 16), DataKind.Half));
+                    break;
+                case DataKind.Float:
+                    replacement.Add(SlimRow.DataRow(aligned, word, DataKind.Float));
+                    break;
+                case DataKind.Word:
+                default:
+                    replacement.Add(SlimRow.DataRow(aligned, word, DataKind.Word));
+                    break;
+            }
+
+            bool alreadyMatches = count == replacement.Count;
+            if (alreadyMatches)
+            {
+                for (int i = 0; i < replacement.Count; i++)
+                {
+                    SlimRow current = _rows[firstIdx + i];
+                    SlimRow next = replacement[i];
+                    if (current.Address != next.Address || current.DataSub != next.DataSub || current.Word != next.Word)
+                    {
+                        alreadyMatches = false;
+                        break;
+                    }
+                }
+            }
+            if (alreadyMatches)
+                return;
+
+            bool selectedInsideConvertedWord = _selRow >= 0 && _selRow < _rows.Count &&
+                _rows[_selRow].Address >= aligned && _rows[_selRow].Address < aligned + 4;
+
+            _disasmList.BeginUpdate();
+            try
+            {
+                _rows.RemoveRange(firstIdx, count);
+                _rows.InsertRange(firstIdx, replacement);
+                _addrIndexDirty = true;
+
+                if (_disasmList.VirtualListSize != _rows.Count)
+                    _disasmList.VirtualListSize = _rows.Count;
+
+                if (selectedInsideConvertedWord)
+                {
+                    int selectIdx = firstIdx;
+                    for (int i = 0; i < replacement.Count; i++)
+                    {
+                        if (replacement[i].Address <= address && address < replacement[i].Address + (replacement[i].DataSub == DataKind.Half ? 2u : replacement[i].DataSub == DataKind.Byte ? 1u : 4u))
+                        {
+                            selectIdx = firstIdx + i;
+                            break;
+                        }
+                    }
+
+                    _selRow = selectIdx;
+                    _disasmList.SelectedIndexChanged -= OnDisasmSelChanged;
+                    try
+                    {
+                        _disasmList.SelectedIndices.Clear();
+                        if (selectIdx >= 0 && selectIdx < _rows.Count)
+                            _disasmList.SelectedIndices.Add(selectIdx);
+                    }
+                    finally
+                    {
+                        _disasmList.SelectedIndexChanged += OnDisasmSelChanged;
+                    }
+                    UpdateSel(selectIdx, syncHex: false);
+                }
+
+                if (firstIdx >= 0 && firstIdx < _rows.Count)
+                    _disasmList.RedrawItems(firstIdx, Math.Min(_rows.Count - 1, firstIdx + replacement.Count - 1), true);
             }
             finally
             {

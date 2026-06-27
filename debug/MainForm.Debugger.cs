@@ -421,8 +421,15 @@ namespace PS2Disassembler
 
         private bool EnsureDebugServerConnected(bool forceRetry = false)
         {
+            if (!AllowLiveDebugClientConnections())
+                return false;
+
             if (_debugServer.IsConnected)
+            {
+                _debugServerAvailable = true;
+                UpdatePineDebugWindowStatus();
                 return true;
+            }
             if (!forceRetry && DateTime.UtcNow < _nextDebugServerRetryUtc)
                 return false;
 
@@ -447,6 +454,18 @@ namespace PS2Disassembler
 
         private void RefreshDebuggerUiTick(bool force = false)
         {
+            if (!AllowLiveDebugClientConnections())
+            {
+                if (!_breakpointUiFrozen)
+                    ClearPausedBreakpointUiState();
+                ClearPausedBreakpointMenuStatus();
+                _lastDebuggerPaused = false;
+                _activeBreakpointAddress = null;
+                _activeBreakpointIsWatchpoint = false;
+                _disasmList?.Invalidate();
+                return;
+            }
+
             if (!force && _breakpointUiFrozen && _breakpointUiFrozenAddress.HasValue)
             {
                 _debugServerAvailable = true;

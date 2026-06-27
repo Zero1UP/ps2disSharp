@@ -169,7 +169,7 @@ namespace PS2Disassembler
         private bool _objectLabelsAvailableFromProject;
         private int _labelsWindowSelectedTabIndex;
 
-        private bool ShouldShowObjectLabelsTab() => IsLiveAttached() || _objectLabelsAvailableFromProject;
+        private bool ShouldShowObjectLabelsTab() => true;
 
         private List<ObjectLabelDefinition> CloneObjectLabelDefinitions(IEnumerable<ObjectLabelDefinition> source)
             => source.Select(x => x.Clone()).ToList();
@@ -319,6 +319,50 @@ namespace PS2Disassembler
                 ConvertAddressToWordData(definition.StaticAddress);
         }
 
+        private static int ObjectLabelDataKindPriority(DataKind kind)
+        {
+            return kind switch
+            {
+                DataKind.Byte => 3,
+                DataKind.Half => 2,
+                DataKind.Float => 1,
+                DataKind.Word => 1,
+                _ => 0,
+            };
+        }
+
+        private void PreferObjectFieldDataKind(Dictionary<uint, DataKind> desiredKinds, uint fieldAddress, uint fieldOffset)
+        {
+            uint aligned = fieldAddress & ~3u;
+            DataKind desiredKind;
+            if ((fieldOffset & 1u) != 0)
+            {
+                desiredKind = DataKind.Byte;
+            }
+            else if ((fieldOffset & 3u) != 0)
+            {
+                desiredKind = DataKind.Half;
+            }
+            else
+            {
+                desiredKind = TryReadWordAt(fieldAddress, out uint word) && LooksLikeFloatWord(word)
+                    ? DataKind.Float
+                    : DataKind.Word;
+            }
+
+            if (!desiredKinds.TryGetValue(aligned, out DataKind existing) ||
+                ObjectLabelDataKindPriority(desiredKind) > ObjectLabelDataKindPriority(existing))
+            {
+                desiredKinds[aligned] = desiredKind;
+            }
+        }
+
+        private void ApplyObjectFieldDataKinds(Dictionary<uint, DataKind> desiredKinds)
+        {
+            foreach (var kv in desiredKinds.OrderBy(x => x.Key))
+                ConvertAddressToDataKind(kv.Key, kv.Value);
+        }
+
         private ObjectLabelUpdateResult ApplyObjectLabelDefinitions(IReadOnlyList<ObjectLabelDefinition> definitions, bool showDialogs)
         {
             ConvertObjectDefinitionsToWordData(definitions);
@@ -330,6 +374,7 @@ namespace PS2Disassembler
             };
 
             var tempLabels = new Dictionary<uint, string>();
+            var desiredFieldKinds = new Dictionary<uint, DataKind>();
 
             if ((_fileData == null || _fileData.Length == 0) && !IsLiveAttached())
             {
@@ -377,10 +422,13 @@ namespace PS2Disassembler
                     }
 
                     AddObjectTempLabel(tempLabels, fieldAddress, field.Label, ref tempLabelCount);
+                    PreferObjectFieldDataKind(desiredFieldKinds, fieldAddress, field.Offset);
                 }
             }
 
             result.TempLabelCount = tempLabelCount;
+
+            ApplyObjectFieldDataKinds(desiredFieldKinds);
 
             _objectTempLabels = tempLabels;
             RefreshObjectLabelDisplays();
@@ -1560,7 +1608,8 @@ namespace PS2Disassembler
             _tabs.AddPage(labelsPage);
             _tabs.AddPage(objectPage);
             Controls.Add(_tabs);
-            _tabs.SetTabVisible(1, _showObjectLabels);
+            _tabs.SetTabEnabled(1, true);
+            _tabs.SetTabVisible(1, true);
             _tabs.SelectedIndexChanged += (_, _) =>
             {
                 if (IsHandleCreated)
@@ -1751,8 +1800,6 @@ namespace PS2Disassembler
             _search.Text = InitialFilter;
             _cbLabelsOnly.Checked = InitialLabelsOnly;
             int desiredTabIndex = InitialSelectedTabIndex >= 0 && InitialSelectedTabIndex < _tabs.Pages.Count ? InitialSelectedTabIndex : 0;
-            if (!_showObjectLabels && desiredTabIndex == 1)
-                desiredTabIndex = 0;
             _tabs.SelectedIndex = desiredTabIndex;
             SetShowObjectLabels(_showObjectLabels);
             PopulateLabelList();
@@ -1869,10 +1916,9 @@ namespace PS2Disassembler
 
         public void SetShowObjectLabels(bool showObjectLabels)
         {
-            _showObjectLabels = showObjectLabels;
-            _tabs.SetTabVisible(1, showObjectLabels);
-            if (!showObjectLabels && _tabs.SelectedIndex == 1)
-                _tabs.SelectedIndex = 0;
+            _showObjectLabels = true;
+            _tabs.SetTabEnabled(1, true);
+            _tabs.SetTabVisible(1, true);
         }
 
         public void SetData(List<(string Name, uint Address)> labels, IEnumerable<ObjectLabelDefinition> objects, bool showObjectLabels)
@@ -2088,8 +2134,7 @@ namespace PS2Disassembler
                 query = query.Where(l => !(l.Name.Length >= 2 && l.Name[0] == '"' && l.Name[^1] == '"'));
             _filtered = string.IsNullOrEmpty(q)
                 ? new List<(string, uint)>(query)
-                : query.Where(l => l.Name.ToLowerInvariant().Contains(q)
-                                || l.Address.ToString("X8").ToLowerInvariant().Contains(q))
+                : query.Where(l => l.Name.ToLowerInvariant().Contains(q))
                        .ToList();
             SortFiltered();
             PopulateLabelList();

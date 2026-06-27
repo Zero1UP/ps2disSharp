@@ -38,6 +38,7 @@ namespace PS2Disassembler
                     },
                     applyLocal:  PatchFileDataAndRows,
                     writePcsx2:  (patches, safeCodePatch) => WritePatchesToLivePcsx2(patches, safeCodePatch: safeCodePatch),
+                    canWriteLive: () => IsLiveAttached(),
                     readEeRam: () =>
                     {
                         if (_liveProcId == 0 || _eeHostAddr == 0)
@@ -114,31 +115,54 @@ namespace PS2Disassembler
         {
             if (_fileData == null || patches.Count == 0) return;
 
-            var eng = GetCachedDisasm();
+            var rowsToRefresh = new HashSet<int>();
 
-            int firstInvalid = int.MaxValue;
-            int lastInvalid  = int.MinValue;
+            void AddRowToRefresh(uint rowAddress)
+            {
+                if (TryGetRowIndexByAddress(rowAddress, out int rowIdx))
+                    rowsToRefresh.Add(rowIdx);
+            }
 
             foreach (var (addr, bytes) in patches)
             {
+                if (bytes == null || bytes.Length == 0) continue;
+
                 long off = (long)addr - _baseAddr;
                 if (off < 0 || off + bytes.Length > _fileData.Length) continue;
 
-                // Patch _fileData
                 Array.Copy(bytes, 0, _fileData, (int)off, bytes.Length);
 
-                // Re-disassemble the containing aligned word
-                uint alignedAddr = addr & ~3u;
-                if (!TryGetRowIndexByAddress(alignedAddr, out int rowIdx)) continue;
+                uint firstAlignedAddr = addr & ~3u;
+                uint lastAlignedAddr = (addr + (uint)bytes.Length - 1u) & ~3u;
+                for (uint wordAddr = firstAlignedAddr; wordAddr <= lastAlignedAddr; wordAddr += 4u)
+                {
+                    AddRowToRefresh(wordAddr);
+                    if (wordAddr > uint.MaxValue - 4u) break;
+                }
 
-                long wordOff = (long)alignedAddr - _baseAddr;
-                if (wordOff < 0 || wordOff + 4 > _fileData.Length) continue;
+                // Byte/half/float display rows may be keyed by their exact data address
+                // instead of the containing aligned instruction address. Refresh those
+                // rows too so ASCII-bar edits and byte-sized patches immediately repaint.
+                if (bytes.Length <= 256)
+                {
+                    for (int i = 0; i < bytes.Length; i++)
+                        AddRowToRefresh(addr + (uint)i);
+                }
+                else
+                {
+                    AddRowToRefresh(addr);
+                    AddRowToRefresh(addr + (uint)bytes.Length - 1u);
+                }
+            }
 
-                uint newWord = BitConverter.ToUInt32(_fileData, (int)wordOff);
-                _rows[rowIdx] = SlimRowFromWord(newWord, alignedAddr);
-
+            int firstInvalid = int.MaxValue;
+            int lastInvalid = int.MinValue;
+            foreach (int rowIdx in rowsToRefresh)
+            {
+                if (rowIdx < 0 || rowIdx >= _rows.Count) continue;
+                _rows[rowIdx] = RefreshRowFromMemory(_rows[rowIdx]);
                 if (rowIdx < firstInvalid) firstInvalid = rowIdx;
-                if (rowIdx > lastInvalid)  lastInvalid  = rowIdx;
+                if (rowIdx > lastInvalid) lastInvalid = rowIdx;
             }
 
             if (firstInvalid <= lastInvalid)
@@ -149,6 +173,16 @@ namespace PS2Disassembler
         {
             if (patches == null || patches.Count == 0)
                 return null;
+
+            // Do not let any patch path implicitly wake PINE/MCP or fall back to
+            // scanning/writing a PCSX2 process when ps2dis# is only viewing a file.
+            // Live writes are allowed only after AttachToPcsx2 establishes the
+            // process id and EE RAM base for this session.
+            if (!IsLiveAttached())
+            {
+                DisconnectLiveDebugClients();
+                return "Skipped PCSX2 write because ps2dis# is not attached to PCSX2.";
+            }
 
             var normalized = NormalizePatches(patches);
             if (normalized.Count == 0)
@@ -853,6 +887,7 @@ namespace PS2Disassembler
             if (data == null || data.Length == 0) return labels;
 
             const int MinLen = 4, MaxShow = 48;
+            var classify = new MipsDisassemblerEx(new DisassemblerOptions { BaseAddress = baseAddr, UseAbiNames = true });
             int i = 0;
             while (i < data.Length)
             {
@@ -862,7 +897,8 @@ namespace PS2Disassembler
                     int start = i;
                     while (i < data.Length && data[i] >= 0x20 && data[i] <= 0x7E) i++;
                     int len = i - start;
-                    if (len >= MinLen && i < data.Length && data[i] == 0x00)
+                    if (len >= MinLen && i < data.Length && data[i] == 0x00 &&
+                        ShouldAcceptAutoStringLabel(data, start, len, baseAddr, classify))
                     {
                         string text = System.Text.Encoding.ASCII.GetString(data, start, Math.Min(len, MaxShow));
                         if (len > MaxShow) text += "…";
@@ -875,6 +911,111 @@ namespace PS2Disassembler
             }
 
             return labels;
+        }
+
+        private static bool ShouldAcceptAutoStringLabel(byte[] data, int start, int len, uint baseAddr, MipsDisassemblerEx classify)
+        {
+            if (len < 4)
+                return false;
+
+            bool strongStringEvidence = HasStrongAsciiStringEvidence(data, start, len);
+            bool hasSeparator = HasAsciiStringSeparator(data, start, len);
+            bool denseInstructionContext = LooksLikeDenseInstructionContext(data, start, len, baseAddr, classify);
+
+            // Short printable runs occur naturally inside EE instructions.  Keep obvious
+            // symbol/name strings such as Enable_c4, but do not let accidental ASCII/null
+            // patterns inside dense code force instruction rows into .byte rows.
+            if (denseInstructionContext)
+                return (len >= 8 && hasSeparator) || (len >= 12 && strongStringEvidence);
+
+            return len >= 6 || strongStringEvidence;
+        }
+
+        private static bool HasAsciiStringSeparator(byte[] data, int start, int len)
+        {
+            int end = Math.Min(data.Length, start + len);
+            for (int i = start; i < end; i++)
+            {
+                char c = (char)data[i];
+                if (c is ' ' or '_' or '-' or '.' or '/' or '\\' or ':' or '%' or '#')
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool HasStrongAsciiStringEvidence(byte[] data, int start, int len)
+        {
+            bool hasLower = false;
+            bool hasUpper = false;
+            bool hasDigit = false;
+            bool hasSeparator = false;
+            bool hasVowel = false;
+
+            int end = Math.Min(data.Length, start + len);
+            for (int i = start; i < end; i++)
+            {
+                char c = (char)data[i];
+                if (c >= 'a' && c <= 'z')
+                {
+                    hasLower = true;
+                    if (c is 'a' or 'e' or 'i' or 'o' or 'u')
+                        hasVowel = true;
+                }
+                else if (c >= 'A' && c <= 'Z')
+                {
+                    hasUpper = true;
+                    char lower = (char)(c + ('a' - 'A'));
+                    if (lower is 'a' or 'e' or 'i' or 'o' or 'u')
+                        hasVowel = true;
+                }
+                else if (c >= '0' && c <= '9')
+                {
+                    hasDigit = true;
+                }
+                else if (c is ' ' or '_' or '-' or '.' or '/' or '\\' or ':' or '%' or '#')
+                {
+                    hasSeparator = true;
+                }
+            }
+
+            if (len >= 8 && (hasLower || hasSeparator))
+                return true;
+            if (len >= 5 && hasLower && hasVowel)
+                return true;
+            if (len >= 4 && hasSeparator && (hasLower || hasUpper || hasDigit))
+                return true;
+            return len >= 10 && (hasLower || hasUpper);
+        }
+
+        private static bool LooksLikeDenseInstructionContext(byte[] data, int start, int len, uint baseAddr, MipsDisassemblerEx classify)
+        {
+            int alignedStart = start & ~3;
+            int alignedEnd = Math.Min(data.Length & ~3, (start + len + 3) & ~3);
+            int before = CountRealInstructionWords(data, Math.Max(0, alignedStart - 12), alignedStart, baseAddr, classify);
+            int after = CountRealInstructionWords(data, alignedEnd, Math.Min(data.Length & ~3, alignedEnd + 12), baseAddr, classify);
+
+            if (before >= 2 && after >= 2)
+                return true;
+            if ((start & 3) != 0 && before + after >= 3)
+                return true;
+
+            int overlapping = CountRealInstructionWords(data, alignedStart, alignedEnd, baseAddr, classify);
+            return overlapping >= 2 && before + after >= 3;
+        }
+
+        private static int CountRealInstructionWords(byte[] data, int start, int end, uint baseAddr, MipsDisassemblerEx classify)
+        {
+            int count = 0;
+            start = Math.Max(0, start & ~3);
+            end = Math.Min(data.Length & ~3, end & ~3);
+            for (int off = start; off + 3 < end; off += 4)
+            {
+                uint word = BitConverter.ToUInt32(data, off);
+                var (kind, _) = classify.DecodeKindAndTarget(word, baseAddr + (uint)off);
+                if (kind != InstructionType.Data && !(kind == InstructionType.Nop && word == 0))
+                    count++;
+            }
+            return count;
         }
 
         private void ScanStringLabels()
@@ -1833,10 +1974,7 @@ namespace PS2Disassembler
                 query = query.Where(l => !(l.Name.Length >= 2 && l.Name[0] == '"' && l.Name[^1] == '"'));
             _filtered = string.IsNullOrEmpty(q)
                 ? new List<(string, uint)>(query)
-                : query.Where(l =>
-                    l.Name.ToLowerInvariant().Contains(q) ||
-                    l.Address.ToString("X8").ToLowerInvariant().Contains(q)
-                  ).ToList();
+                : query.Where(l => l.Name.ToLowerInvariant().Contains(q)).ToList();
             SortFiltered();
             PopulateList();
         }
@@ -2137,6 +2275,7 @@ namespace PS2Disassembler
         private readonly Func<uint, int, byte[]?>                               _read;
         private readonly Action<IReadOnlyList<(uint Addr, byte[] Bytes)>>        _applyLocal;
         private readonly Func<IReadOnlyList<(uint Addr, byte[] Bytes)>, bool, string?> _writePcsx2;
+        private readonly Func<bool> _canWriteLive;
         private readonly RichTextBox _tbCodes;
         private readonly RichTextBox _tbInject;
         private Label? _lblEnterCodes;
@@ -2179,12 +2318,14 @@ namespace PS2Disassembler
             Func<uint, int, byte[]?> read,
             Action<IReadOnlyList<(uint Addr, byte[] Bytes)>> applyLocal,
             Func<IReadOnlyList<(uint Addr, byte[] Bytes)>, bool, string?> writePcsx2,
+            Func<bool> canWriteLive,
             Func<(byte[]?, string?)> readEeRam,
             Action<uint> navigateToCenter)
         {
             _read       = read;
             _applyLocal = applyLocal;
             _writePcsx2 = writePcsx2;
+            _canWriteLive = canWriteLive;
             _readEeRam  = readEeRam;
             _navigateToCenter = navigateToCenter;
 
@@ -2319,8 +2460,16 @@ namespace PS2Disassembler
             _activeCodesTimer = new System.Windows.Forms.Timer { Interval = 100 };
             _activeCodesTimer.Tick += (_, _) =>
             {
-                if (!IsDisposed && !string.IsNullOrWhiteSpace(_activeCodesText))
-                    ApplyActiveCodes(showMessage: false);
+                if (IsDisposed || string.IsNullOrWhiteSpace(_activeCodesText))
+                    return;
+
+                // Constant-write codes are live-only. When the app is just viewing a
+                // binary, keep the codes armed in the editor but do not issue local
+                // patch cycles or PCSX2/PINE/MCP writes every timer tick.
+                if (!_canWriteLive())
+                    return;
+
+                ApplyActiveCodes(showMessage: false);
             };
             _activeCodesTimer.Start();
 
@@ -2665,7 +2814,16 @@ namespace PS2Disassembler
             if (patches.Count > 0)
             {
                 _applyLocal(patches);
-                string? pcsx2Err = _writePcsx2(patches, safeCodePatch);
+                string? pcsx2Err = null;
+                if (_canWriteLive())
+                {
+                    pcsx2Err = _writePcsx2(patches, safeCodePatch);
+                }
+                else if (showMessage)
+                {
+                    pcsx2Err = "Skipped PCSX2 write because ps2dis# is not attached to PCSX2.";
+                }
+
                 if (pcsx2Err != null && showMessage)
                     MessageBox.Show($"Local disassembly updated, but PCSX2 write failed:\r\n{pcsx2Err}",
                         "GameShark Tools", MessageBoxButtons.OK, MessageBoxIcon.Warning);

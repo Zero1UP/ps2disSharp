@@ -7,7 +7,7 @@ namespace PS2Disassembler
     internal sealed class AppSettings
     {
         // Application version — increment by 0.0.001 whenever packaging the source into a zip
-        public const string AppVersion = "0.0.135";
+        public const string AppVersion = "0.0.140";
 
         // Defaults
         public const string DefaultFontFamily = "Liberation Mono";

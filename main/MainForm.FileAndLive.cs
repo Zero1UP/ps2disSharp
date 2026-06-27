@@ -254,6 +254,414 @@ namespace PS2Disassembler
                 LoadFile(dlg.FileName, isRawDump: false);
         }
 
+        private enum ImportedLabelMatchKind
+        {
+            DirectAddress,
+            FunctionFingerprint,
+        }
+
+        private readonly struct ImportedLabelTarget
+        {
+            public ImportedLabelTarget(uint address, ImportedLabelMatchKind kind)
+            {
+                Address = address;
+                Kind = kind;
+            }
+
+            public uint Address { get; }
+            public ImportedLabelMatchKind Kind { get; }
+        }
+
+        private sealed class ImportedLabelResolution
+        {
+            public Dictionary<uint, string> Labels { get; init; } = new();
+            public Dictionary<uint, ImportedLabelTarget> Targets { get; init; } = new();
+            public int Skipped { get; init; }
+            public bool UsedSourceImage { get; init; }
+        }
+
+        private sealed class ImportedLabelApplyResult
+        {
+            public int Imported;
+            public int FunctionMatched;
+            public int DirectMatched;
+            public int Unmatched;
+        }
+
+        private readonly struct CodeFingerprint : IEquatable<CodeFingerprint>
+        {
+            public CodeFingerprint(ulong hashA, ulong hashB, uint firstToken, uint lastToken, int count)
+            {
+                HashA = hashA;
+                HashB = hashB;
+                FirstToken = firstToken;
+                LastToken = lastToken;
+                Count = count;
+            }
+
+            private ulong HashA { get; }
+            private ulong HashB { get; }
+            private uint FirstToken { get; }
+            private uint LastToken { get; }
+            private int Count { get; }
+
+            public bool Equals(CodeFingerprint other)
+                => HashA == other.HashA && HashB == other.HashB &&
+                   FirstToken == other.FirstToken && LastToken == other.LastToken && Count == other.Count;
+
+            public override bool Equals(object? obj)
+                => obj is CodeFingerprint other && Equals(other);
+
+            public override int GetHashCode()
+                => HashCode.Combine(HashA, HashB, FirstToken, LastToken, Count);
+        }
+
+        private const int ImportedLabelFingerprintMinInstructions = 8;
+        private const int ImportedLabelFingerprintMaxInstructions = 20;
+
+        private static ImportedLabelResolution ResolveElfImportedLabels(ElfInfo elf, byte[] elfData, byte[] currentData, uint currentBase)
+        {
+            var result = CollectElfLabelsStatic(elf);
+            byte[]? sourceImage = null;
+            uint sourceBase = 0;
+            bool usedSourceImage = false;
+            if (ElfParser.TryBuildLoadImage(elfData, elf, out var loadImage, out var loadBase))
+            {
+                sourceImage = loadImage;
+                sourceBase = loadBase;
+                usedSourceImage = sourceImage.Length > 0;
+            }
+
+            var targets = ResolveImportedLabelTargets(result.labels.Keys, sourceImage, sourceBase, currentData, currentBase);
+            return new ImportedLabelResolution
+            {
+                Labels = result.labels,
+                Targets = targets,
+                Skipped = result.skipped,
+                UsedSourceImage = usedSourceImage,
+            };
+        }
+
+        private static ImportedLabelResolution ResolvePisImportedLabels(byte[] pisData, byte[] currentData, uint currentBase)
+        {
+            if (!TryParsePisFile(pisData, out var sourceImage, out var labels, out _))
+            {
+                return new ImportedLabelResolution
+                {
+                    Labels = new Dictionary<uint, string>(),
+                    Targets = new Dictionary<uint, ImportedLabelTarget>(),
+                    Skipped = 0,
+                    UsedSourceImage = false,
+                };
+            }
+
+            var labelMap = new Dictionary<uint, string>();
+            foreach (var (address, rawLabel) in labels)
+            {
+                string label = CleanupPisImportedLabel(rawLabel);
+                if (string.IsNullOrWhiteSpace(label))
+                    continue;
+
+                labelMap[NormalizeImportedLabelAddress(address)] = label;
+            }
+
+            var targets = ResolveImportedLabelTargets(labelMap.Keys, sourceImage, 0x00000000u, currentData, currentBase);
+            return new ImportedLabelResolution
+            {
+                Labels = labelMap,
+                Targets = targets,
+                Skipped = 0,
+                UsedSourceImage = sourceImage.Length > 0,
+            };
+        }
+
+        private ImportedLabelApplyResult ApplyResolvedImportedLabels(ImportedLabelResolution resolution, bool mergeWithProjectLabels)
+        {
+            var apply = new ImportedLabelApplyResult();
+
+            foreach (var (sourceAddress, importedLabel) in resolution.Labels)
+            {
+                if (!resolution.Targets.TryGetValue(sourceAddress, out var target))
+                {
+                    apply.Unmatched++;
+                    continue;
+                }
+
+                string finalLabel = importedLabel;
+                uint targetAddress = NormalizeImportedLabelAddress(target.Address);
+                if (mergeWithProjectLabels && _userLabels.TryGetValue(targetAddress, out var existingLabel) && !string.IsNullOrWhiteSpace(existingLabel))
+                    finalLabel = MergeProjectAndElfLabel(existingLabel, importedLabel);
+
+                if (_userLabels.TryGetValue(targetAddress, out var currentLabel) && string.Equals(currentLabel, finalLabel, StringComparison.Ordinal))
+                    continue;
+
+                _userLabels[targetAddress] = finalLabel;
+                apply.Imported++;
+                if (target.Kind == ImportedLabelMatchKind.FunctionFingerprint)
+                    apply.FunctionMatched++;
+                else
+                    apply.DirectMatched++;
+            }
+
+            return apply;
+        }
+
+        private static Dictionary<uint, ImportedLabelTarget> ResolveImportedLabelTargets(IEnumerable<uint> sourceAddresses, byte[]? sourceImage, uint sourceBase, byte[] currentData, uint currentBase)
+        {
+            var sourceList = sourceAddresses
+                .Select(NormalizeImportedLabelAddress)
+                .Distinct()
+                .ToList();
+            var targets = new Dictionary<uint, ImportedLabelTarget>(sourceList.Count);
+            if (currentData.Length == 0 || sourceList.Count == 0)
+                return targets;
+
+            if (sourceImage == null || sourceImage.Length == 0)
+            {
+                foreach (uint sourceAddress in sourceList)
+                {
+                    if (IsAddressInsideImage(sourceAddress, currentBase, currentData))
+                        targets[sourceAddress] = new ImportedLabelTarget(sourceAddress, ImportedLabelMatchKind.DirectAddress);
+                }
+                return targets;
+            }
+
+            var wanted = new Dictionary<CodeFingerprint, List<uint>>();
+            foreach (uint sourceAddress in sourceList)
+            {
+                if (!TryBuildCodeFingerprintAtAddress(sourceImage, sourceBase, sourceAddress, out var fp))
+                    continue;
+
+                if (!wanted.TryGetValue(fp, out var addresses))
+                {
+                    addresses = new List<uint>(1);
+                    wanted[fp] = addresses;
+                }
+                addresses.Add(sourceAddress);
+            }
+
+            if (wanted.Count > 0)
+            {
+                var uniqueCurrentMatches = new Dictionary<CodeFingerprint, uint>();
+                var duplicateCurrentMatches = new HashSet<CodeFingerprint>();
+                for (int offset = 0; offset + ImportedLabelFingerprintMinInstructions * 4 <= currentData.Length; offset += 4)
+                {
+                    if (!TryBuildCodeFingerprintAtOffset(currentData, offset, out var fp) || !wanted.ContainsKey(fp))
+                        continue;
+
+                    if (duplicateCurrentMatches.Contains(fp))
+                        continue;
+
+                    uint targetAddress = NormalizeImportedLabelAddress(currentBase + (uint)offset);
+                    if (uniqueCurrentMatches.ContainsKey(fp))
+                    {
+                        uniqueCurrentMatches.Remove(fp);
+                        duplicateCurrentMatches.Add(fp);
+                    }
+                    else
+                    {
+                        uniqueCurrentMatches[fp] = targetAddress;
+                    }
+                }
+
+                foreach (var (fp, sourceMatches) in wanted)
+                {
+                    if (sourceMatches.Count != 1 || duplicateCurrentMatches.Contains(fp))
+                        continue;
+
+                    if (uniqueCurrentMatches.TryGetValue(fp, out uint targetAddress))
+                        targets[sourceMatches[0]] = new ImportedLabelTarget(targetAddress, ImportedLabelMatchKind.FunctionFingerprint);
+                }
+            }
+
+            foreach (uint sourceAddress in sourceList)
+            {
+                if (targets.ContainsKey(sourceAddress))
+                    continue;
+
+                if (CanUseDirectImportedLabelAddress(sourceImage, sourceBase, currentData, currentBase, sourceAddress))
+                    targets[sourceAddress] = new ImportedLabelTarget(sourceAddress, ImportedLabelMatchKind.DirectAddress);
+            }
+
+            return targets;
+        }
+
+        private static bool CanUseDirectImportedLabelAddress(byte[] sourceImage, uint sourceBase, byte[] currentData, uint currentBase, uint sourceAddress)
+        {
+            if (!IsAddressInsideImage(sourceAddress, currentBase, currentData))
+                return false;
+
+            if (TryBuildCodeFingerprintAtAddress(sourceImage, sourceBase, sourceAddress, out var sourceFp) &&
+                TryBuildCodeFingerprintAtAddress(currentData, currentBase, sourceAddress, out var currentFp) &&
+                sourceFp.Equals(currentFp))
+            {
+                return true;
+            }
+
+            return BytesMatchAtAddress(sourceImage, sourceBase, currentData, currentBase, sourceAddress, 16);
+        }
+
+        private static bool BytesMatchAtAddress(byte[] sourceImage, uint sourceBase, byte[] currentData, uint currentBase, uint address, int byteCount)
+        {
+            if (!TryGetImageOffsetForNormalizedAddress(address, sourceBase, sourceImage, out int sourceOffset) ||
+                !TryGetImageOffsetForNormalizedAddress(address, currentBase, currentData, out int currentOffset))
+            {
+                return false;
+            }
+
+            int count = Math.Min(byteCount, Math.Min(sourceImage.Length - sourceOffset, currentData.Length - currentOffset));
+            if (count <= 0)
+                return false;
+
+            for (int i = 0; i < count; i++)
+            {
+                if (sourceImage[sourceOffset + i] != currentData[currentOffset + i])
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool IsAddressInsideImage(uint address, uint imageBase, byte[] image)
+            => TryGetImageOffsetForNormalizedAddress(address, imageBase, image, out _);
+
+        private static bool TryBuildCodeFingerprintAtAddress(byte[] image, uint imageBase, uint address, out CodeFingerprint fingerprint)
+        {
+            fingerprint = default;
+            if (!TryGetImageOffsetForNormalizedAddress(address, imageBase, image, out int offset))
+                return false;
+            offset &= ~3;
+            return TryBuildCodeFingerprintAtOffset(image, offset, out fingerprint);
+        }
+
+        private static bool TryGetImageOffsetForNormalizedAddress(uint address, uint imageBase, byte[] image, out int offset)
+        {
+            offset = -1;
+            uint normalizedAddress = NormalizeImportedLabelAddress(address);
+            uint normalizedBase = NormalizeImportedLabelAddress(imageBase);
+            long localOffset = (long)normalizedAddress - normalizedBase;
+            if (localOffset < 0 || localOffset >= image.Length)
+                return false;
+            offset = (int)localOffset;
+            return true;
+        }
+
+        private static bool TryBuildCodeFingerprintAtOffset(byte[] image, int offset, out CodeFingerprint fingerprint)
+        {
+            fingerprint = default;
+            if (offset < 0 || (offset & 3) != 0 || offset + 4 > image.Length)
+                return false;
+
+            ulong hashA = 1469598103934665603UL;
+            ulong hashB = 1099511628211UL;
+            uint firstToken = 0;
+            uint lastToken = 0;
+            int count = 0;
+            bool sawNonZero = false;
+            bool includeDelaySlotThenStop = false;
+
+            int maxInstructions = Math.Min(ImportedLabelFingerprintMaxInstructions, (image.Length - offset) / 4);
+            for (int i = 0; i < maxInstructions; i++)
+            {
+                uint word = ReadU32LE(image, offset + i * 4);
+                uint token = NormalizeMipsInstructionForFunctionFingerprint(word);
+                if (count == 0)
+                    firstToken = token;
+                lastToken = token;
+                sawNonZero |= word != 0;
+
+                hashA ^= token;
+                hashA *= 1099511628211UL;
+                hashB = (hashB * 16777619UL) ^ ((ulong)token + (ulong)(uint)count * 0x9E3779B9UL);
+                count++;
+
+                if (includeDelaySlotThenStop)
+                    break;
+                if (IsMipsReturnInstruction(word))
+                    includeDelaySlotThenStop = true;
+            }
+
+            if (!sawNonZero || count < ImportedLabelFingerprintMinInstructions)
+                return false;
+
+            fingerprint = new CodeFingerprint(hashA, hashB, firstToken, lastToken, count);
+            return true;
+        }
+
+        private static uint ReadU32LE(byte[] data, int offset)
+            => (uint)(data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24));
+
+        private static bool IsMipsReturnInstruction(uint word)
+        {
+            uint op = word >> 26;
+            if (op != 0) return false;
+            uint rs = (word >> 21) & 0x1F;
+            uint funct = word & 0x3F;
+            return funct == 0x08 && rs == 31; // jr ra
+        }
+
+        private static uint NormalizeMipsInstructionForFunctionFingerprint(uint word)
+        {
+            uint op = word >> 26;
+            if (op == 0)
+                return word;
+
+            if (op is 0x02 or 0x03)
+                return op << 26; // j / jal: ignore absolute target
+
+            // Ignore the immediate/offset field. This keeps labels portable across
+            // builds where functions moved and branch/call/data addresses changed,
+            // while retaining opcode and register shape for uniqueness.
+            return word & 0xFFFF0000u;
+        }
+
+        private static (Dictionary<uint, string> labels, int skipped) CollectElfLabelsStatic(ElfInfo elf)
+        {
+            var bestByAddress = new Dictionary<uint, (string Label, int Score)>();
+            int skipped = 0;
+
+            foreach (var sym in elf.Symbols)
+            {
+                if (!TryGetElfImportLabelStatic(sym, out uint address, out string label, out int score))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                if (!bestByAddress.TryGetValue(address, out var existing) ||
+                    score > existing.Score ||
+                    (score == existing.Score && label.Length > existing.Label.Length))
+                {
+                    bestByAddress[address] = (label, score);
+                }
+            }
+
+            return (bestByAddress.ToDictionary(kv => kv.Key, kv => kv.Value.Label), skipped);
+        }
+
+        private static bool TryGetElfImportLabelStatic(ElfSymbol sym, out uint address, out string label, out int score)
+        {
+            address = 0;
+            label = string.Empty;
+            score = 0;
+
+            if (sym.Value == 0 || sym.Shndx == 0)
+                return false;
+
+            if (sym.Type > 2)
+                return false;
+
+            label = CleanupImportedLabel(sym.Name);
+            if (string.IsNullOrWhiteSpace(label))
+                return false;
+
+            if (label.StartsWith("@", StringComparison.Ordinal) || label.StartsWith(".", StringComparison.Ordinal))
+                return false;
+
+            address = NormalizeImportedLabelAddress(sym.Value);
+            score = ScoreElfSymbol(sym, label);
+            return true;
+        }
+
         private async void ImportLabelsFromElf()
         {
             if (_fileData == null)
@@ -293,35 +701,28 @@ namespace PS2Disassembler
             _progressBar.Maximum = 100;
 
             bool mergeWithProjectLabels = !string.IsNullOrWhiteSpace(_currentProjectPath);
-            var result = await Task.Run(() => CollectElfLabels(elf));
+            byte[] currentData = _fileData;
+            uint currentBase = _baseAddr;
+            var resolution = await Task.Run(() => ResolveElfImportedLabels(elf, elfData, currentData, currentBase));
 
             _progressBar.Value = 80;
-            int imported = 0;
-            foreach (var (address, elfLabel) in result.labels)
-            {
-                string finalLabel = elfLabel;
-                if (mergeWithProjectLabels && _userLabels.TryGetValue(address, out var existingLabel) && !string.IsNullOrWhiteSpace(existingLabel))
-                    finalLabel = MergeProjectAndElfLabel(existingLabel, elfLabel);
-
-                if (_userLabels.TryGetValue(address, out var currentLabel) && string.Equals(currentLabel, finalLabel, StringComparison.Ordinal))
-                    continue;
-
-                _userLabels[address] = finalLabel;
-                imported++;
-            }
+            var applied = ApplyResolvedImportedLabels(resolution, mergeWithProjectLabels);
 
             RebuildLabelCache();
             _disasmList.Invalidate();
             _progressBar.Value = 100;
             _progressBar.Visible = false;
-            _sbProgress.Text     = $"Imported {imported} label(s).";
+            _sbProgress.Text     = $"Imported {applied.Imported} label(s).";
 
             string mergeNote = mergeWithProjectLabels
                 ? "\nMatching project labels were merged as ImportedLabel #ProjectLabel."
                 : string.Empty;
+            string matchNote = resolution.UsedSourceImage
+                ? $"\nFunction-matched: {applied.FunctionMatched:N0}; direct verified: {applied.DirectMatched:N0}; unmatched/skipped by matcher: {applied.Unmatched:N0}."
+                : $"\nDirect-address imported: {applied.DirectMatched:N0}; unmatched: {applied.Unmatched:N0}.";
 
             MessageBox.Show(this,
-                $"Imported {imported} label(s).\n{result.skipped} symbol(s) were skipped.{mergeNote}",
+                $"Imported {applied.Imported} label(s).\n{resolution.Skipped} symbol(s) were skipped.{matchNote}{mergeNote}",
                 "Import Labels", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
@@ -342,31 +743,25 @@ namespace PS2Disassembler
             }
 
             bool mergeWithProjectLabels = !string.IsNullOrWhiteSpace(_currentProjectPath);
-            var labels = await Task.Run(() => ParsePisLabels(pisData));
+            byte[] currentData = _fileData ?? Array.Empty<byte>();
+            uint currentBase = _baseAddr;
+            var resolution = await Task.Run(() => ResolvePisImportedLabels(pisData, currentData, currentBase));
 
             _progressBar.Value = 80;
-            int imported = 0;
-            foreach (var (address, pisLabel) in labels)
-            {
-                string finalLabel = pisLabel;
-                if (mergeWithProjectLabels && _userLabels.TryGetValue(address, out var existingLabel) && !string.IsNullOrWhiteSpace(existingLabel))
-                    finalLabel = MergeProjectAndElfLabel(existingLabel, pisLabel);
-
-                if (_userLabels.TryGetValue(address, out var currentLabel) && string.Equals(currentLabel, finalLabel, StringComparison.Ordinal))
-                    continue;
-
-                _userLabels[address] = finalLabel;
-                imported++;
-            }
+            var applied = ApplyResolvedImportedLabels(resolution, mergeWithProjectLabels);
 
             RebuildLabelCache();
             _disasmList.Invalidate();
             _progressBar.Value = 100;
             _progressBar.Visible = false;
-            _sbProgress.Text = $"Imported {imported} label(s) from .pis file.";
+            _sbProgress.Text = $"Imported {applied.Imported} label(s) from .pis file.";
+
+            string matchNote = resolution.UsedSourceImage
+                ? $"\nFunction-matched: {applied.FunctionMatched:N0}; direct verified: {applied.DirectMatched:N0}; unmatched/skipped by matcher: {applied.Unmatched:N0}."
+                : $"\nDirect-address imported: {applied.DirectMatched:N0}; unmatched: {applied.Unmatched:N0}.";
 
             MessageBox.Show(this,
-                $"Imported {imported} label(s) from .pis file.\n{labels.Count} total symbol(s) found.",
+                $"Imported {applied.Imported} label(s) from .pis file.\n{resolution.Labels.Count} total symbol(s) found.{matchNote}",
                 "Import Labels", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
@@ -1653,6 +2048,10 @@ namespace PS2Disassembler
             while (_pineLogBacklog.Count > 0)
                 _pineDebugWindow.AppendLine(_pineLogBacklog.Dequeue());
 
+            // Opening the debug window should not keep stale PINE/MCP client sockets alive
+            // after the app has disconnected from PCSX2 or the attached PCSX2 process exited.
+            AllowLiveDebugClientConnections();
+
             // Update connection status labels
             _pineDebugWindow.SetPineStatus(_pineAvailable);
             _pineDebugWindow.SetMcpStatus(_debugServerAvailable);
@@ -1680,8 +2079,56 @@ namespace PS2Disassembler
             _pineDebugWindow.SetMcpStatus(_debugServerAvailable);
         }
 
+        private void DisconnectLiveDebugClients(string? reason = null)
+        {
+            bool hadPine = _pineAvailable || _pine.IsConnected;
+            bool hadDebugServer = _debugServerAvailable || _debugServer.IsConnected;
+
+            if (hadPine)
+            {
+                try { _pine.Disconnect(); } catch { }
+            }
+
+            if (hadDebugServer)
+            {
+                try { _debugServer.Disconnect(); } catch { }
+            }
+
+            _pineAvailable = false;
+            _debugServerAvailable = false;
+            _nextPineRetryUtc = DateTime.MinValue;
+            _nextDebugServerRetryUtc = DateTime.MinValue;
+            _nextDebuggerPollUtc = DateTime.MinValue;
+
+            if (!string.IsNullOrWhiteSpace(reason) && (hadPine || hadDebugServer))
+                LogPine(reason);
+
+            if (hadPine || hadDebugServer)
+                UpdatePineDebugWindowStatus();
+        }
+
+        private bool AllowLiveDebugClientConnections()
+        {
+            if (!HasLiveAttachment())
+            {
+                DisconnectLiveDebugClients("Disconnected PINE/MCP clients because ps2dis# is not attached to PCSX2.");
+                return false;
+            }
+
+            if (!IsAttachedPcsx2ProcessAliveCached())
+            {
+                DisconnectLiveDebugClients("Disconnected PINE/MCP clients because the attached PCSX2 process is no longer running.");
+                return false;
+            }
+
+            return true;
+        }
+
         private bool EnsurePineConnected(bool forceRetry = false)
         {
+            if (!AllowLiveDebugClientConnections())
+                return false;
+
             if (_pine.IsConnected)
             {
                 _pineAvailable = true;
@@ -1729,16 +2176,7 @@ namespace PS2Disassembler
 
         private void ResetLiveDebugConnectionsAfterEndpointChange()
         {
-            try { _pine.Disconnect(); } catch { }
-            try { _debugServer.Disconnect(); } catch { }
-
-            _pineAvailable = false;
-            _debugServerAvailable = false;
-            _nextPineRetryUtc = DateTime.MinValue;
-            _nextDebugServerRetryUtc = DateTime.MinValue;
-            _nextDebuggerPollUtc = DateTime.MinValue;
-
-            UpdatePineDebugWindowStatus();
+            DisconnectLiveDebugClients("Disconnected PINE/MCP clients because the debug connection endpoint changed.");
         }
 
         private uint OffsetToPineAddress(int offset)
@@ -2483,6 +2921,8 @@ namespace PS2Disassembler
                     }
                     _liveProcId = procId;
                     _eeHostAddr = eeHostAddr;
+                    _lastLiveAttachmentProcessAlive = true;
+                    _nextLiveAttachmentProcessCheckUtc = DateTime.MinValue;
                     RestorePreservedKernelWindow(eeMem);
                     InstallEeRam(eeMem);
                     LogPine($"Attach complete. PID={procId}, EEmemHost=0x{eeHostAddr:X}");
@@ -2542,19 +2982,14 @@ namespace PS2Disassembler
             _breakpointUiFrozenAddress = null;
             _lastDebuggerPaused = false;
 
-            // Disconnect PINE
-            try { _pine.Disconnect(); } catch { }
-            _pineAvailable = false;
-            _nextPineRetryUtc = DateTime.MinValue;
-
-            // Disconnect debug server
-            try { _debugServer.Disconnect(); } catch { }
-            _debugServerAvailable = false;
-            _nextDebugServerRetryUtc = DateTime.MinValue;
+            // Disconnect live debug clients before clearing attachment state.
+            DisconnectLiveDebugClients("Disconnected PINE/MCP clients because ps2dis# disconnected from PCSX2.");
 
             // Clear live state
             _liveProcId = 0;
             _eeHostAddr = 0;
+            _lastLiveAttachmentProcessAlive = false;
+            _nextLiveAttachmentProcessCheckUtc = DateTime.MinValue;
             _liveReading = false;
 
             // Clear file/disassembly data
@@ -3176,6 +3611,11 @@ namespace PS2Disassembler
         {
             if (_liveReading || _fileData == null)
                 return;
+            if (!AllowLiveDebugClientConnections())
+            {
+                SetStatusText("Live: PCSX2 disconnected");
+                return;
+            }
             if (!Visible || WindowState == FormWindowState.Minimized)
                 return;
 
@@ -3506,6 +3946,8 @@ namespace PS2Disassembler
                     _rows.TrimExcess();
                     _cachedDisasm = null; // force rebuild with correct base address
                     ReloadRows();
+                    if (_objectLabelDefinitions.Count > 0)
+                        ApplyObjectLabelDefinitions(_objectLabelDefinitions, showDialogs: false);
                     _sbProgress.Text = $"{rowCount:N0} rows";
 
                     // Break the completion closure's references to large temporary objects

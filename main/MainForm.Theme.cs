@@ -968,6 +968,8 @@ namespace PS2Disassembler
             {
                 DoubleBuffered = true;
                 ResizeRedraw = true;
+                SetStyle(ControlStyles.Selectable, true);
+                TabStop = true;
             }
         }
 
@@ -2104,6 +2106,7 @@ namespace PS2Disassembler
                 _mainTabs.ShowTabStrip = !showTabsInTitleBar;
 
             SyncMainViewMenuState();
+            UpdateStartPanelVisibility();
         }
 
         private void ApplyMemoryViewVisibilitySetting()
@@ -2124,12 +2127,14 @@ namespace PS2Disassembler
         {
             bool showCodeDesigner = _appSettings?.ShowCodeDesigner ?? AppSettings.DefaultShowCodeDesigner;
 
+            _mainTabs?.SetTabEnabled(3, true);
             _mainTabs?.SetTabVisible(3, showCodeDesigner);
 
             if (!showCodeDesigner && _mainTabs != null && _mainTabs.SelectedIndex == 3)
                 _mainTabs.SelectedIndex = 0;
 
             SyncMainViewMenuState();
+            UpdateStartPanelVisibility();
         }
 
         protected override void Dispose(bool disposing)
